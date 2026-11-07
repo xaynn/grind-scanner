@@ -313,7 +313,7 @@ GrindScanner is hardened against client-side tampering during competitive screen
 Ensure the latest stable Rust toolchain is installed:
 ```powershell
 # Clone the repository
-git clone https://github.com/your-username/grind-scanner.git
+git clone https://github.com/xaynn/grind-scanner.git
 cd grind-scanner
 
 # Build in release mode (LTO & optimized)
@@ -331,9 +331,9 @@ Run `grind_scanner.exe` as Administrator. The hardware-accelerated GUI launches 
 ```powershell
 .\grind_scanner.exe
 ```
-* Click **"Uruchom pełny skan" (Start Full Scan)**.
-* Monitor live memory scanning throughput (MB/s) and real-time category progress.
-* Once complete, click **"Otwórz raport HTML"** or **"Kopiuj do Discorda"**.
+* **Automatic System Localization:** GrindScanner detects your Windows system language (`GetUserDefaultUILanguage`) and seamlessly adapts the GUI, interactive HTML report, and Discord exports to **English** (default) or **Polish**.
+* **Zero-Click Execution:** The audit begins immediately upon startup, streaming live memory throughput (MB/s) and real-time category progress.
+* **Instant Export:** Once complete, click **"OPEN REPORT IN BROWSER"** (*"OTWÓRZ RAPORT W PRZEGLĄDARCE"*) to view the interactive forensic breakdown, or **"COPY REPORT FOR STAFF (DISCORD)"** (*"KOPIUJ RAPORT DLA ADMINISTRACJI"*) to paste a formatted summary directly into your screenshare channel.
 
 ### 2. Headless CLI Mode (Automated / Screenshare Scripts)
 Run with the `--cli` or `-c` flag to execute silently in the console without opening a window:
