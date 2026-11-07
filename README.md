@@ -5,6 +5,7 @@
   <img src="https://img.shields.io/badge/Platform-Windows_10%2F11_x64-blue.svg?style=for-the-badge&logo=windows" alt="Windows 10/11 x64">
   <img src="https://img.shields.io/badge/UI-GPU_Accelerated_egui-purple.svg?style=for-the-badge" alt="egui">
   <img src="https://img.shields.io/badge/Pattern_Engine-SIMD_Aho--Corasick_&_YARA--X-red.svg?style=for-the-badge" alt="Aho-Corasick & YARA-X">
+  <img src="https://img.shields.io/badge/Privacy-100%25_Offline_%2F_Zero_Telemetry-success.svg?style=for-the-badge" alt="Zero Telemetry">
   <img src="https://img.shields.io/badge/Integrity-HMAC_SHA--256_Seal-success.svg?style=for-the-badge" alt="SHA-256 Seal">
   <img src="https://img.shields.io/badge/Status-Production_Ready-emerald.svg?style=for-the-badge" alt="Production Ready">
 </p>
@@ -22,6 +23,7 @@ In traditional screenshares, staff members have to download 4-5 different third-
 2. **GrindScanner scans in seconds:** It inspects Minecraft's active memory for injected cheat classes and checks deep Windows system logs for files that were deleted or launched prior to the check.
 3. **Staff receives verifiable proof:** GrindScanner generates a clean, interactive HTML report (`scan_report.html`) and a summary that can be pasted straight into your Discord screenshare ticket channel.
 4. **Instantly Extensible:** Found a new ghost client or memory dump? Drop your custom strings or YARA rules into the `/rules/` folder—GrindScanner hot-loads them automatically without needing any recompilation!
+5. **100% Offline & Private:** Zero external servers, zero telemetry. No personal files, Discord tokens, or browser data are ever transmitted—everything runs strictly on the player's local machine.
 
 ---
 
@@ -35,6 +37,20 @@ In traditional screenshares, staff members have to download 4-5 different third-
 > * **What GrindScanner excels at:** Catching active ghost clients in RAM, finding unbacked executable memory (manual mapping), recovering evidence of deleted cheat `.jar`/`.dll` files from NTFS records, catching Prefetch traces, detecting cleared Windows Event Logs, and flagging system tampering.
 > * **What NO user-mode tool can guarantee:** Novel private bypasses, custom hypervisors / ring-0 kernel cheats, or unknown proprietary ghost clients with no public signatures.
 > * **How Staff Should Use It:** GrindScanner eliminates 95% of tedious manual work. If a scan is 🟢 **CLEAN**, it means no known cheat artifacts or tampering indicators were discovered—however, final server decisions should always consider in-game suspicious gameplay and staff discretion.
+
+### 🛡️ Client-Side Security Model: The Inherent Trade-Off & Our Privacy Advantage
+
+#### 1. The Client-Side Reality (Can It Be Bypassed or Cracked?)
+In software and cybersecurity architecture, any program running locally in user-space on an endpoint machine is subject to the fundamental reality of **client-side trust**:
+* **The player controls the hardware and OS:** A skilled reverse engineer or cheat developer with local Administrator or Kernel-level access can theoretically inspect memory, hook Windows APIs, or attempt to tamper with user-mode executables.
+* **No snake oil:** While GrindScanner implements robust defensive measures (thread hiding from debuggers via `NtSetInformationThread`, PEB `BeingDebugged` neutralization, SEH exception handlers, and HMAC-SHA256 report verification), we are completely transparent: **no client-side scanner running on the suspect's own PC can ever claim to be mathematically uncrackable.**
+
+#### 2. Why Running Locally is Our Greatest Asset (100% Privacy & Zero Telemetry)
+Paradoxically, the fact that everything runs purely on the player's computer is **GrindScanner's greatest strength and competitive advantage**:
+* 🌐 **Zero Remote Servers & Zero Telemetry:** GrindScanner makes **0 outbound network calls**. It communicates with no external cloud servers, databases, or third-party APIs. It is fully air-gapped and works 100% offline.
+* 🔒 **Complete Player Privacy:** Traditional screenshare tools often act like invasive spyware—silently scraping browser sessions, Discord tokens, personal photos, or uploading raw memory dumps to third-party web servers. GrindScanner **never collects or leaks private user data**.
+* 💻 **Everything Happens on the Player's Machine:** Memory scanning, NTFS artifact parsing, and report generation (`scan_report.html`) occur strictly inside local RAM.
+* 🤝 **Mutual Trust & Transparency:** Players don't have to fear running sketchy closed-source cloud uploaders, and server staff get instant, reproducible forensic evidence without external server downtimes or data-compliance risks.
 
 ### 🚦 Verdict Levels Explained:
 * 🔴 **DETECTION (Cheat Detected):** Irrefutable proof of a known cheat signature, injected DLL module, or unauthorized memory modification.
