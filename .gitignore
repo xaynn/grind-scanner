@@ -1,0 +1,7 @@
+/target
+scan_report.json
+scan_report.html
+data.txt
+*.log
+.DS_Store
+Thumbs.db
