@@ -12,13 +12,13 @@
 
 ---
 
-## 📌 What is GrindScanner? (In Plain English)
+## 📌 What is GrindScanner?
 
 If you run a competitive Minecraft server or do **Screenshares (SS)**, GrindScanner is an automated, one-click tool to check suspected players for cheats and ghost clients.
 
 In traditional screenshares, staff members have to download 4-5 different third-party programs (Process Hacker, FTK Imager, LastActivityView, USN parsers) and spend 20–30 minutes manually digging through memory strings, Prefetch folders, and Registry hives. **GrindScanner automates this entire forensic audit in under 5 seconds with a single click.**
 
-### 🕹️ How It Works in 3 Simple Steps:
+### 🕹️ How It Works:
 1. **The suspect opens the game** and runs `grind_scanner.exe` as Administrator.
 2. **GrindScanner scans in seconds:** It inspects Minecraft's active memory for injected cheat classes and checks deep Windows system logs for files that were deleted or launched prior to the check.
 3. **Staff receives verifiable proof:** GrindScanner generates a clean, interactive HTML report (`scan_report.html`) and a summary that can be pasted straight into your Discord screenshare ticket channel.
