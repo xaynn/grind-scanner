@@ -1,9 +1,6 @@
 use crate::report::{FindingCategory, ScanFinding, ScanReport, VerdictLevel};
-use crate::scanner::forensics::{
-    format_filetime, get_boot_unix_timestamp, was_executed_in_current_session,
-};
-use std::collections::HashSet;
-use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
+use crate::scanner::forensics::{format_filetime, was_executed_in_current_session};
+use windows_sys::Win32::Storage::FileSystem::{GetDiskFreeSpaceExW, GetDriveTypeW};
 use windows_sys::Win32::System::Registry::{
     RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW, HKEY_CURRENT_USER,
     HKEY_LOCAL_MACHINE, KEY_READ,
@@ -14,7 +11,6 @@ pub fn scan_usbstor(report: &mut ScanReport) {
     scan_mountpoints2_registry(report);
     scan_active_drives(report);
     scan_network_shares_and_nodrives(report);
-    scan_usb_event_logs(report);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -231,42 +227,47 @@ unsafe fn scan_usbstor_device(
                         );
                     }
                     DeviceConnectionStatus::Connected => {
-                        report.add(
-                            ScanFinding::new(
-                                "Active USB Storage Device Connected in Current Session",
-                                FindingCategory::TamperingAndAntiForensics,
-                                VerdictLevel::Warning,
-                                format!(
-                                    "Wykryto zewnętrzną pamięć USB ({}), która jest OBECNIE PODŁĄCZONA do komputera i była aktywna w bieżącej sesji systemu Windows.",
-                                    friendly_name
-                                ),
-                            )
-                            .with_evidence("Urządzenie USB", friendly_name.clone())
-                            .with_evidence(
-                                "Status sprzętowy PnP",
-                                "PODŁĄCZONE (Wpięte w port USB, aktywne w systemie Windows)".to_string(),
-                            )
-                            .with_evidence("Identyfikator sprzętowy PnP", pnp_id.clone())
-                            .with_evidence("Numer seryjny / Instancja", serial.clone())
-                            .with_evidence("Czas ostatniej aktywności / modyfikacji rejestru", time_str.clone()),
-                        );
+                        // Only report if there is an active removable drive with media to avoid false positives on audio/headset dongles
+                        if has_any_active_removable_media() {
+                            report.add(
+                                ScanFinding::new(
+                                    "Active USB Storage Device Connected in Current Session",
+                                    FindingCategory::TamperingAndAntiForensics,
+                                    VerdictLevel::Warning,
+                                    format!(
+                                        "Wykryto zewnętrzną pamięć USB ({}), która jest OBECNIE PODŁĄCZONA do komputera i była aktywna w bieżącej sesji systemu Windows.",
+                                        friendly_name
+                                    ),
+                                )
+                                .with_evidence("Urządzenie USB", friendly_name.clone())
+                                .with_evidence(
+                                    "Status sprzętowy PnP",
+                                    "PODŁĄCZONE (Wpięte w port USB, aktywne w systemie Windows)".to_string(),
+                                )
+                                .with_evidence("Identyfikator sprzętowy PnP", pnp_id.clone())
+                                .with_evidence("Numer seryjny / Instancja", serial.clone())
+                                .with_evidence("Czas ostatniej aktywności / modyfikacji rejestru", time_str.clone()),
+                            );
+                        }
                     }
                     DeviceConnectionStatus::Unknown => {
-                        report.add(
-                            ScanFinding::new(
-                                "USB Storage Device Connected in Current Session",
-                                FindingCategory::TamperingAndAntiForensics,
-                                VerdictLevel::Warning,
-                                format!(
-                                    "Wykryto podłączenie zewnętrznej pamięci USB w bieżącej sesji systemu Windows: {}. Cheaty i injectory są często uruchamiane z pendrive'a i odłączane przed sprawdzeniem.",
-                                    friendly_name
-                                ),
-                            )
-                            .with_evidence("Urządzenie USB", friendly_name.clone())
-                            .with_evidence("Identyfikator sprzętowy", device_key.to_string())
-                            .with_evidence("Numer seryjny / Instancja", serial.clone())
-                            .with_evidence("Czas ostatniej modyfikacji / podłączenia", time_str),
-                        );
+                        if has_any_active_removable_media() {
+                            report.add(
+                                ScanFinding::new(
+                                    "USB Storage Device Connected in Current Session",
+                                    FindingCategory::TamperingAndAntiForensics,
+                                    VerdictLevel::Warning,
+                                    format!(
+                                        "Wykryto podłączenie zewnętrznej pamięci USB w bieżącej sesji systemu Windows: {}. Cheaty i injectory są często uruchamiane z pendrive'a i odłączane przed sprawdzeniem.",
+                                        friendly_name
+                                    ),
+                                )
+                                .with_evidence("Urządzenie USB", friendly_name.clone())
+                                .with_evidence("Identyfikator sprzętowy", device_key.to_string())
+                                .with_evidence("Numer seryjny / Instancja", serial.clone())
+                                .with_evidence("Czas ostatniej modyfikacji / podłączenia", time_str),
+                            );
+                        }
                     }
                 }
             }
@@ -412,7 +413,36 @@ fn scan_mountpoints2_registry(report: &mut ScanReport) {
     }
 }
 
-/// Scans active drive letters for removable (DRIVE_REMOVABLE = 2) and network (DRIVE_REMOTE = 4) media
+/// Checks whether there is any active removable drive with readable media present (total_bytes > 0).
+fn has_any_active_removable_media() -> bool {
+    const DRIVE_REMOVABLE: u32 = 2;
+    for letter in b'D'..=b'Z' {
+        let root_str = format!("{}:\\\0", letter as char);
+        let root_w: Vec<u16> = root_str.encode_utf16().collect();
+        if unsafe { GetDriveTypeW(root_w.as_ptr()) } == DRIVE_REMOVABLE {
+            let mut free_avail = 0u64;
+            let mut total_bytes = 0u64;
+            let mut total_free = 0u64;
+            let has_media = unsafe {
+                GetDiskFreeSpaceExW(
+                    root_w.as_ptr(),
+                    &mut free_avail,
+                    &mut total_bytes,
+                    &mut total_free,
+                ) != 0 && total_bytes > 0
+            };
+            if has_media {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Scans active drive letters for removable (DRIVE_REMOVABLE = 2) and network (DRIVE_REMOTE = 4) media.
+/// For removable drives, verifies that the drive actually contains readable media (total_bytes > 0).
+/// This prevents false positives on empty card readers, virtual drives, and wireless headset dongles
+/// that register a dummy removable drive letter without any media.
 fn scan_active_drives(report: &mut ScanReport) {
     const DRIVE_REMOVABLE: u32 = 2;
     const DRIVE_REMOTE: u32 = 4;
@@ -423,14 +453,37 @@ fn scan_active_drives(report: &mut ScanReport) {
 
         let drive_type = unsafe { GetDriveTypeW(root_w.as_ptr()) };
         if drive_type == DRIVE_REMOVABLE {
+            let mut free_avail = 0u64;
+            let mut total_bytes = 0u64;
+            let mut total_free = 0u64;
+
+            let has_media = unsafe {
+                GetDiskFreeSpaceExW(
+                    root_w.as_ptr(),
+                    &mut free_avail,
+                    &mut total_bytes,
+                    &mut total_free,
+                ) != 0 && total_bytes > 0
+            };
+
+            // If the drive is not ready (ERROR_NOT_READY) or has size 0, it's an empty slot / headset dongle!
+            if !has_media {
+                continue;
+            }
+
+            let size_gb = total_bytes as f64 / 1_073_741_824.0;
             report.add(
                 ScanFinding::new(
                     "Active Removable Drive (USB) Connected",
                     FindingCategory::TamperingAndAntiForensics,
                     VerdictLevel::Warning,
-                    format!("W systemie znajduje się obecnie podłączony aktywny nośnik wymienny USB: {}:\\", letter as char),
+                    format!(
+                        "W systemie znajduje się obecnie podłączony aktywny nośnik wymienny USB: {}:\\ ({:.2} GB)",
+                        letter as char, size_gb
+                    ),
                 )
                 .with_evidence("Litera dysku", format!("{}:\\", letter as char))
+                .with_evidence("Pojemność nośnika", format!("{:.2} GB", size_gb))
                 .with_evidence("Typ nośnika", "DRIVE_REMOVABLE (Pamięć flash USB / Dysk zewnętrzny)".to_string()),
             );
         } else if drive_type == DRIVE_REMOTE {
@@ -573,421 +626,6 @@ fn scan_hkcu_network(report: &mut ScanReport) {
     }
 }
 
-type EvtHandle = *mut std::ffi::c_void;
-type EvtQueryFn = unsafe extern "system" fn(
-    session: EvtHandle,
-    path: *const u16,
-    query: *const u16,
-    flags: u32,
-) -> EvtHandle;
-type EvtNextFn = unsafe extern "system" fn(
-    result_set: EvtHandle,
-    event_array_size: u32,
-    event_array: *mut EvtHandle,
-    timeout: u32,
-    flags: u32,
-    returned: *mut u32,
-) -> i32;
-type EvtCloseFn = unsafe extern "system" fn(handle: EvtHandle) -> i32;
-type EvtRenderFn = unsafe extern "system" fn(
-    context: EvtHandle,
-    fragment: EvtHandle,
-    flags: u32,
-    buffer_size: u32,
-    buffer: *mut std::ffi::c_void,
-    buffer_used: *mut u32,
-    property_count: *mut u32,
-) -> i32;
-
-/// Skanuje dzienniki zdarzeń Windows w poszukiwaniu śladów odpięcia i podłączenia urządzeń USB w bieżącej sesji.
-fn scan_usb_event_logs(report: &mut ScanReport) {
-    unsafe {
-        let wevtapi =
-            windows_sys::Win32::System::LibraryLoader::LoadLibraryA(b"wevtapi.dll\0".as_ptr());
-        if wevtapi.is_null() {
-            return;
-        }
-
-        let p_query = windows_sys::Win32::System::LibraryLoader::GetProcAddress(
-            wevtapi,
-            b"EvtQuery\0".as_ptr(),
-        );
-        let p_next = windows_sys::Win32::System::LibraryLoader::GetProcAddress(
-            wevtapi,
-            b"EvtNext\0".as_ptr(),
-        );
-        let p_close = windows_sys::Win32::System::LibraryLoader::GetProcAddress(
-            wevtapi,
-            b"EvtClose\0".as_ptr(),
-        );
-        let p_render = windows_sys::Win32::System::LibraryLoader::GetProcAddress(
-            wevtapi,
-            b"EvtRender\0".as_ptr(),
-        );
-
-        if let (Some(f_query), Some(f_next), Some(f_close), Some(f_render)) =
-            (p_query, p_next, p_close, p_render)
-        {
-            let evt_query: EvtQueryFn = std::mem::transmute(f_query);
-            let evt_next: EvtNextFn = std::mem::transmute(f_next);
-            let evt_close: EvtCloseFn = std::mem::transmute(f_close);
-            let evt_render: EvtRenderFn = std::mem::transmute(f_render);
-
-            let mut reported_events = HashSet::new();
-            scan_stor_diag_events(report, evt_query, evt_next, evt_close, evt_render, &mut reported_events);
-            scan_driver_frameworks_events(report, evt_query, evt_next, evt_close, evt_render, &mut reported_events);
-            scan_partition_diagnostic_events(report, evt_query, evt_next, evt_close, evt_render, &mut reported_events);
-        }
-    }
-}
-
-/// 1. Microsoft-Windows-Storage-ClassPnP/Operational (Event 507)
-/// SenseKey 2 (Not Ready), AdditionalSenseCode 58 (0x3A = Medium Not Present).
-/// Wykrywa natychmiastowe/gwałtowne wyciągnięcie pendrive'a z portu USB.
-unsafe fn scan_stor_diag_events(
-    report: &mut ScanReport,
-    evt_query: EvtQueryFn,
-    evt_next: EvtNextFn,
-    evt_close: EvtCloseFn,
-    evt_render: EvtRenderFn,
-    reported_events: &mut HashSet<String>,
-) {
-    unsafe {
-        const EVT_QUERY_CHANNEL_PATH: u32 = 0x1;
-        const EVT_QUERY_REVERSE_DIRECTION: u32 = 0x200;
-        let query_flags = EVT_QUERY_CHANNEL_PATH | EVT_QUERY_REVERSE_DIRECTION;
-
-        let chan_w: Vec<u16> = "Microsoft-Windows-Storage-ClassPnP/Operational\0"
-            .encode_utf16()
-            .collect();
-        let query_w: Vec<u16> =
-            "*[System[Provider[@Name='Microsoft-Windows-StorDiag'] and EventID=507]]\0"
-                .encode_utf16()
-                .collect();
-
-        let h_query = evt_query(
-            std::ptr::null_mut(),
-            chan_w.as_ptr(),
-            query_w.as_ptr(),
-            query_flags,
-        );
-        if h_query.is_null() {
-            return;
-        }
-
-        let mut events: [EvtHandle; 32] = [std::ptr::null_mut(); 32];
-        let mut returned = 0u32;
-
-        if evt_next(h_query, 32, events.as_mut_ptr(), 500, 0, &mut returned) != 0 && returned > 0 {
-            for i in 0..returned as usize {
-                let h_event = events[i];
-                let mut buf = [0u16; 4096];
-                let mut used = 0u32;
-                let mut prop_count = 0u32;
-
-                if evt_render(
-                    std::ptr::null_mut(),
-                    h_event,
-                    1, // EvtRenderEventXml
-                    (buf.len() * 2) as u32,
-                    buf.as_mut_ptr() as *mut std::ffi::c_void,
-                    &mut used,
-                    &mut prop_count,
-                ) != 0
-                    && used > 0
-                {
-                    let xml_len = (used as usize / 2).saturating_sub(1);
-                    let xml_text = String::from_utf16_lossy(&buf[..xml_len]);
-
-                    let sense_key = extract_xml_data(&xml_text, "SenseKey").unwrap_or_default();
-                    let asc = extract_xml_data(&xml_text, "AdditionalSenseCode").unwrap_or_default();
-
-                    // SenseKey 2 = Not Ready, ASC 58 (0x3A) = Medium Not Present (USB abruptly removed)
-                    if sense_key == "2" && asc == "58" {
-                        let (in_session, time_str) = parse_xml_time_session(extract_xml_time(&xml_text).as_deref());
-                        if in_session {
-                            let vendor = extract_xml_data(&xml_text, "Vendor").unwrap_or_else(|| "USB".to_string());
-                            let model = extract_xml_data(&xml_text, "Model").unwrap_or_else(|| "Storage Device".to_string());
-                            let serial = extract_xml_data(&xml_text, "SerialNumber").unwrap_or_else(|| "Nieznany".to_string());
-                            let full_name = format!("{} {}", vendor.trim(), model.trim());
-
-                            let dedup_key = format!("507_{}_{}", serial, time_str);
-                            if reported_events.insert(dedup_key) {
-                                report.add(
-                                    ScanFinding::new(
-                                        "Abrupt USB Storage Removal Detected (ClassPnP Event 507 / Medium Not Present)",
-                                        FindingCategory::TamperingAndAntiForensics,
-                                        VerdictLevel::Detection,
-                                        format!(
-                                            "Sterownik pamięci masowej Windows zarejestrował nagłe odłączenie/wyciągnięcie nośnika USB bez bezpiecznego wysunięcia (SenseKey 2 / ASC 58: Medium Not Present) w bieżącej sesji: {}. Jest to silny dowód na gwałtowne wyjęcie pendrive'a z portu USB.",
-                                            full_name
-                                        ),
-                                    )
-                                    .with_evidence("Urządzenie USB", full_name)
-                                    .with_evidence("Numer seryjny nośnika", serial)
-                                    .with_evidence("Kod błędu SCSI", "SenseKey 2 (Not Ready), ASC 58 (Medium Not Present / Abrupt Removal)".to_string())
-                                    .with_evidence("Dokładny czas odłączenia", time_str),
-                                );
-                            }
-                        }
-                    }
-                }
-                evt_close(h_event);
-            }
-        }
-
-        evt_close(h_query);
-    }
-}
-
-/// 2. Microsoft-Windows-DriverFrameworks-UserMode/Operational (Event 2102, 2103, 2105)
-/// Wykrywa fizyczne odłączenie/usunięcie urządzenia PnP z portu.
-unsafe fn scan_driver_frameworks_events(
-    report: &mut ScanReport,
-    evt_query: EvtQueryFn,
-    evt_next: EvtNextFn,
-    evt_close: EvtCloseFn,
-    evt_render: EvtRenderFn,
-    reported_events: &mut HashSet<String>,
-) {
-    unsafe {
-        const EVT_QUERY_CHANNEL_PATH: u32 = 0x1;
-        const EVT_QUERY_REVERSE_DIRECTION: u32 = 0x200;
-        let query_flags = EVT_QUERY_CHANNEL_PATH | EVT_QUERY_REVERSE_DIRECTION;
-
-        let chan_w: Vec<u16> = "Microsoft-Windows-DriverFrameworks-UserMode/Operational\0"
-            .encode_utf16()
-            .collect();
-        let query_w: Vec<u16> =
-            "*[System[Provider[@Name='Microsoft-Windows-DriverFrameworks-UserMode'] and (EventID=2102 or EventID=2103 or EventID=2105)]]\0"
-                .encode_utf16()
-                .collect();
-
-        let h_query = evt_query(
-            std::ptr::null_mut(),
-            chan_w.as_ptr(),
-            query_w.as_ptr(),
-            query_flags,
-        );
-        if h_query.is_null() {
-            return;
-        }
-
-        let mut events: [EvtHandle; 32] = [std::ptr::null_mut(); 32];
-        let mut returned = 0u32;
-
-        if evt_next(h_query, 32, events.as_mut_ptr(), 500, 0, &mut returned) != 0 && returned > 0 {
-            for i in 0..returned as usize {
-                let h_event = events[i];
-                let mut buf = [0u16; 4096];
-                let mut used = 0u32;
-                let mut prop_count = 0u32;
-
-                if evt_render(
-                    std::ptr::null_mut(),
-                    h_event,
-                    1,
-                    (buf.len() * 2) as u32,
-                    buf.as_mut_ptr() as *mut std::ffi::c_void,
-                    &mut used,
-                    &mut prop_count,
-                ) != 0
-                    && used > 0
-                {
-                    let xml_len = (used as usize / 2).saturating_sub(1);
-                    let xml_text = String::from_utf16_lossy(&buf[..xml_len]);
-
-                    let (in_session, time_str) = parse_xml_time_session(extract_xml_time(&xml_text).as_deref());
-                    if in_session {
-                        let event_id = if xml_text.contains("<EventID>2102</EventID>") {
-                            "2102 (Device Unplug / Stop)"
-                        } else if xml_text.contains("<EventID>2103</EventID>") {
-                            "2103 (Device Removal)"
-                        } else {
-                            "2105 (Device Removal Complete)"
-                        };
-
-                        let instance_id = extract_xml_data(&xml_text, "InstanceId")
-                            .or_else(|| extract_xml_data(&xml_text, "DeviceInstanceId"))
-                            .unwrap_or_else(|| "Urządzenie USB / PnP".to_string());
-
-                        let dedup_key = format!("umdf_{}_{}", instance_id, time_str);
-                        if reported_events.insert(dedup_key) {
-                            report.add(
-                                ScanFinding::new(
-                                    "USB Device Unplugged / Disconnected (DriverFrameworks Event)",
-                                    FindingCategory::TamperingAndAntiForensics,
-                                    VerdictLevel::Detection,
-                                    format!(
-                                        "W dzienniku zdarzeń sterowników Windows (DriverFrameworks-UserMode) zarejestrowano fizyczne odłączenie/usunięcie urządzenia w bieżącej sesji: {}.",
-                                        instance_id
-                                    ),
-                                )
-                                .with_evidence("Zidentyfikowane urządzenie", instance_id)
-                                .with_evidence("Zdarzenie PnP", event_id.to_string())
-                                .with_evidence("Dokładny czas odłączenia", time_str),
-                            );
-                        }
-                    }
-                }
-                evt_close(h_event);
-            }
-        }
-
-        evt_close(h_query);
-    }
-}
-
-/// 3. Microsoft-Windows-Partition/Diagnostic (Event 1006)
-/// BusType 7 = BusTypeUsb.
-/// Wykrywa aktywność wolumenu USB, weryfikując czy nośnik został wypięty z portu.
-unsafe fn scan_partition_diagnostic_events(
-    report: &mut ScanReport,
-    evt_query: EvtQueryFn,
-    evt_next: EvtNextFn,
-    evt_close: EvtCloseFn,
-    evt_render: EvtRenderFn,
-    reported_events: &mut HashSet<String>,
-) {
-    unsafe {
-        const EVT_QUERY_CHANNEL_PATH: u32 = 0x1;
-        const EVT_QUERY_REVERSE_DIRECTION: u32 = 0x200;
-        let query_flags = EVT_QUERY_CHANNEL_PATH | EVT_QUERY_REVERSE_DIRECTION;
-
-        let chan_w: Vec<u16> = "Microsoft-Windows-Partition/Diagnostic\0"
-            .encode_utf16()
-            .collect();
-        let query_w: Vec<u16> =
-            "*[System[Provider[@Name='Microsoft-Windows-Partition'] and EventID=1006]]\0"
-                .encode_utf16()
-                .collect();
-
-        let h_query = evt_query(
-            std::ptr::null_mut(),
-            chan_w.as_ptr(),
-            query_w.as_ptr(),
-            query_flags,
-        );
-        if h_query.is_null() {
-            return;
-        }
-
-        let mut events: [EvtHandle; 32] = [std::ptr::null_mut(); 32];
-        let mut returned = 0u32;
-
-        if evt_next(h_query, 32, events.as_mut_ptr(), 500, 0, &mut returned) != 0 && returned > 0 {
-            for i in 0..returned as usize {
-                let h_event = events[i];
-                let mut buf = [0u16; 4096];
-                let mut used = 0u32;
-                let mut prop_count = 0u32;
-
-                if evt_render(
-                    std::ptr::null_mut(),
-                    h_event,
-                    1,
-                    (buf.len() * 2) as u32,
-                    buf.as_mut_ptr() as *mut std::ffi::c_void,
-                    &mut used,
-                    &mut prop_count,
-                ) != 0
-                    && used > 0
-                {
-                    let xml_len = (used as usize / 2).saturating_sub(1);
-                    let xml_text = String::from_utf16_lossy(&buf[..xml_len]);
-
-                    let bus_type = extract_xml_data(&xml_text, "BusType").unwrap_or_default();
-                    // BusType 7 = BusTypeUsb in Windows
-                    if bus_type == "7" {
-                        let (in_session, time_str) = parse_xml_time_session(extract_xml_time(&xml_text).as_deref());
-                        if in_session {
-                            let mfg = extract_xml_data(&xml_text, "Manufacturer").unwrap_or_else(|| "USB".to_string());
-                            let model = extract_xml_data(&xml_text, "Model").unwrap_or_else(|| "Storage Device".to_string());
-                            let serial = extract_xml_data(&xml_text, "SerialNumber").unwrap_or_else(|| "Nieznany".to_string());
-                            let parent_id = extract_xml_data(&xml_text, "ParentId").unwrap_or_default();
-                            let full_name = format!("{} {}", mfg.trim(), model.trim());
-
-                            let pnp_status = if !parent_id.is_empty() {
-                                query_device_pnp_status(&parent_id)
-                            } else {
-                                DeviceConnectionStatus::Unknown
-                            };
-
-                            // If the USB volume was active in this session, but the device is now Disconnected!
-                            if pnp_status == DeviceConnectionStatus::Disconnected {
-                                let dedup_key = format!("1006_{}_{}", serial, time_str);
-                                if reported_events.insert(dedup_key) {
-                                    report.add(
-                                        ScanFinding::new(
-                                            "USB Volume Disconnected / Unplugged in Current Session (Partition Event 1006)",
-                                            FindingCategory::TamperingAndAntiForensics,
-                                            VerdictLevel::Detection,
-                                            format!(
-                                                "Dziennik partycji Windows zarejestrował wolumen pamięci USB ({}, S/N: {}), który był zamontowany w bieżącej sesji, lecz urządzenie zostało ODŁĄCZONE (wypięte z portu) przed wykonaniem skanowania.",
-                                                full_name, serial
-                                            ),
-                                        )
-                                        .with_evidence("Urządzenie USB", full_name)
-                                        .with_evidence("Numer seryjny / Identyfikator", serial)
-                                        .with_evidence("Status urządzenia", "ODŁĄCZONE (Urządzenie nie znajduje się obecnie w portach USB)".to_string())
-                                        .with_evidence("Identyfikator nadrzędny PnP", parent_id)
-                                        .with_evidence("Czas zdarzenia partycji", time_str),
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-                evt_close(h_event);
-            }
-        }
-
-        evt_close(h_query);
-    }
-}
-
-fn extract_xml_data(xml: &str, tag_name: &str) -> Option<String> {
-    for prefix in [
-        format!("<Data Name='{}'>", tag_name),
-        format!("<Data Name=\"{}\">", tag_name),
-    ] {
-        if let Some(pos) = xml.find(&prefix) {
-            let start = pos + prefix.len();
-            if let Some(end) = xml[start..].find("</Data>") {
-                return Some(xml[start..start + end].trim().to_string());
-            }
-        }
-    }
-    None
-}
-
-fn extract_xml_time(xml: &str) -> Option<String> {
-    if let Some(pos) = xml.find("SystemTime='") {
-        if let Some(end) = xml[pos + 12..].find('\'') {
-            return Some(xml[pos + 12..pos + 12 + end].to_string());
-        }
-    } else if let Some(pos) = xml.find("SystemTime=\"") {
-        if let Some(end) = xml[pos + 12..].find('"') {
-            return Some(xml[pos + 12..pos + 12 + end].to_string());
-        }
-    }
-    None
-}
-
-fn parse_xml_time_session(time_str: Option<&str>) -> (bool, String) {
-    if let Some(t_str) = time_str {
-        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(t_str) {
-            let unix_secs = dt.timestamp().max(0) as u64;
-            let boot_secs = get_boot_unix_timestamp();
-            let is_current_session = unix_secs >= boot_secs.saturating_sub(60);
-            let local_dt: chrono::DateTime<chrono::Local> = dt.with_timezone(&chrono::Local);
-            let formatted = local_dt.format("%Y-%m-%d %H:%M:%S").to_string();
-            return (is_current_session, formatted);
-        }
-    }
-    (false, "Brak daty".to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1000,15 +638,5 @@ mod tests {
             status,
             DeviceConnectionStatus::Disconnected | DeviceConnectionStatus::Unknown
         ));
-    }
-
-    #[test]
-    fn test_extract_xml_helpers() {
-        let sample_xml = r#"<Event><System><TimeCreated SystemTime='2026-11-08T22:08:53.1479756Z'/></System><EventData><Data Name='Vendor'>Kingston</Data><Data Name='Model'>DataTraveler 3.0</Data><Data Name='SenseKey'>2</Data><Data Name='AdditionalSenseCode'>58</Data></EventData></Event>"#;
-        assert_eq!(extract_xml_data(sample_xml, "Vendor"), Some("Kingston".to_string()));
-        assert_eq!(extract_xml_data(sample_xml, "Model"), Some("DataTraveler 3.0".to_string()));
-        assert_eq!(extract_xml_data(sample_xml, "SenseKey"), Some("2".to_string()));
-        assert_eq!(extract_xml_data(sample_xml, "AdditionalSenseCode"), Some("58".to_string()));
-        assert_eq!(extract_xml_time(sample_xml), Some("2026-11-08T22:08:53.1479756Z".to_string()));
     }
 }
