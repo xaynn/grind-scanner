@@ -143,5 +143,29 @@ mod tests {
         let matched: Vec<_> = scan_res.matching_rules().map(|r| r.identifier().to_string()).collect();
         assert!(matched.contains(&"ValidTestRule".to_string()));
     }
+
+    #[test]
+    fn test_orchard_and_evhate_client_rules_detection() {
+        let engine = YaraScannerEngine::new_embedded();
+        let mut scanner = engine.create_scanner().unwrap();
+
+        // Test Orchard Client detection via build metadata
+        let orchard_build_sample = b"... random data ... orchard_subversion ... more data ... orchard_build ...";
+        let scan_orchard_1 = scanner.scan(orchard_build_sample).unwrap();
+        let matches_1: Vec<_> = scan_orchard_1.matching_rules().map(|r| r.identifier().to_string()).collect();
+        assert!(matches_1.contains(&"Orchard_Client".to_string()), "Orchard must be detected via embedded build metadata");
+
+        // Test Orchard Client detection via mixin handlers
+        let orchard_mixin_sample = b"xyz handler$bap000$orchard$aaa ... redirect$bal000$orchard$a ... modify$bde000$orchard$a ... $orchard$aab";
+        let scan_orchard_2 = scanner.scan(orchard_mixin_sample).unwrap();
+        let matches_2: Vec<_> = scan_orchard_2.matching_rules().map(|r| r.identifier().to_string()).collect();
+        assert!(matches_2.contains(&"Orchard_Client".to_string()), "Orchard must be detected via embedded mixin handlers");
+
+        // Test Evhate Client detection via MixinPlugin
+        let evhate_sample = b"... /juxxl/evhate/compat/EvhateClientMixinPlugin.classPK ...";
+        let scan_evhate = scanner.scan(evhate_sample).unwrap();
+        let matches_evhate: Vec<_> = scan_evhate.matching_rules().map(|r| r.identifier().to_string()).collect();
+        assert!(matches_evhate.contains(&"Evhate_Client".to_string()), "Evhate must be detected via embedded mixin plugin");
+    }
 }
 

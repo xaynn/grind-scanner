@@ -2295,6 +2295,21 @@ fn get_builtin_cheat_patterns() -> &'static [CheatPatternRule] {
         CheatPatternRule { pattern: "net/java/s.class", name: "Doomsday Class (s.class)", description: "Wykryto wstrzykniętą klasę Doomsday net/java/s.class.", level: VerdictLevel::Detection },
         CheatPatternRule { pattern: "net/java/t.class", name: "Doomsday Class (t.class)", description: "Wykryto wstrzykniętą klasę Doomsday net/java/t.class.", level: VerdictLevel::Detection },
         CheatPatternRule { pattern: "net/java/y.class", name: "Doomsday Class (y.class)", description: "Wykryto wstrzykniętą klasę Doomsday net/java/y.class.", level: VerdictLevel::Detection },
+
+        // --- EVHATE CLIENT (Fabric/Forge Ghost Client) ---
+        CheatPatternRule { pattern: "juxxl/evhate/compat/EvhateClientMixinPlugin", name: "Evhate Client Mixin Plugin", description: "Wykryto plugin wstrzykujący mixiny cheata Evhate Client.", level: VerdictLevel::Detection },
+        CheatPatternRule { pattern: "juxxl.evhate.compat.EvhateClientMixinPlugin", name: "Evhate Client Mixin Plugin (Dotted)", description: "Wykryto pakiet wstrzykujący cheata Evhate Client.", level: VerdictLevel::Detection },
+        CheatPatternRule { pattern: "Ljuxxl/evhate/Evhate;", name: "Evhate Client Core Descriptor", description: "Wykryto deskryptor klasy głównej cheata Evhate Client.", level: VerdictLevel::Detection },
+        CheatPatternRule { pattern: "juxxl/evhate/Evhate.class", name: "Evhate Client Main Class", description: "Wykryto skompilowaną klasę cheata Evhate Client.", level: VerdictLevel::Detection },
+        CheatPatternRule { pattern: "juxxl/evhate/Evhate$$Lambda", name: "Evhate Client Event Lambda", description: "Wykryto dynamiczne proxy lambdy obsługi zdarzeń Evhate Client.", level: VerdictLevel::Detection },
+
+        // --- ORCHARD CLIENT (Fabric Ghost Client / Mixin Detours) ---
+        CheatPatternRule { pattern: "orchard_subversion", name: "Orchard Client Subversion", description: "Wykryto metadane wersji cheata Orchard Client.", level: VerdictLevel::Detection },
+        CheatPatternRule { pattern: "orchard_build", name: "Orchard Client Build", description: "Wykryto identyfikator buildu cheata Orchard Client.", level: VerdictLevel::Detection },
+        CheatPatternRule { pattern: "handler$bap000$orchard$", name: "Orchard Client Handler Hook", description: "Wykryto bytecode hook metody bojowej cheata Orchard Client.", level: VerdictLevel::Detection },
+        CheatPatternRule { pattern: "redirect$bal000$orchard$", name: "Orchard Client Redirect Hook", description: "Wykryto przekierowanie wywołania (redirect) cheata Orchard Client.", level: VerdictLevel::Detection },
+        CheatPatternRule { pattern: "modify$bde000$orchard$", name: "Orchard Client Modify Hook", description: "Wykryto modyfikację parametrów bytecode (modify) cheata Orchard Client.", level: VerdictLevel::Detection },
+        CheatPatternRule { pattern: "localvar$bdf000$orchard$", name: "Orchard Client LocalVar Hook", description: "Wykryto manipulację zmienną lokalną (localvar) cheata Orchard Client.", level: VerdictLevel::Detection },
     ]
 }
 

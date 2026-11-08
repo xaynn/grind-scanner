@@ -12,18 +12,49 @@ use std::env;
 use std::io::{self, BufRead};
 
 fn main() -> eframe::Result<()> {
-    // Suppress system modal error dialogs (SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX)
+    // Suppress system modal error dialogs (SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX)
     // Ensures Windows never halts execution with "Bad Image / 0xc0000428" popups
     unsafe {
         windows_sys::Win32::System::Diagnostics::Debug::SetErrorMode(
             windows_sys::Win32::System::Diagnostics::Debug::SEM_FAILCRITICALERRORS
-                | windows_sys::Win32::System::Diagnostics::Debug::SEM_NOGPFAULTERRORBOX,
+                | windows_sys::Win32::System::Diagnostics::Debug::SEM_NOGPFAULTERRORBOX
+                | windows_sys::Win32::System::Diagnostics::Debug::SEM_NOOPENFILEERRORBOX,
         );
         windows_sys::Win32::System::Diagnostics::Debug::SetThreadErrorMode(
             windows_sys::Win32::System::Diagnostics::Debug::SEM_FAILCRITICALERRORS
-                | windows_sys::Win32::System::Diagnostics::Debug::SEM_NOGPFAULTERRORBOX,
+                | windows_sys::Win32::System::Diagnostics::Debug::SEM_NOGPFAULTERRORBOX
+                | windows_sys::Win32::System::Diagnostics::Debug::SEM_NOOPENFILEERRORBOX,
             std::ptr::null_mut(),
         );
+
+        // Low-level NT kernel hard error suppression (ProcessDefaultHardErrorMode = 12)
+        let ntdll = windows_sys::Win32::System::LibraryLoader::GetModuleHandleA(b"ntdll.dll\0".as_ptr());
+        if !ntdll.is_null() {
+            type NtSetInformationProcessFn = unsafe extern "system" fn(
+                process_handle: windows_sys::Win32::Foundation::HANDLE,
+                process_information_class: u32,
+                process_information: *const std::ffi::c_void,
+                process_information_length: u32,
+            ) -> i32;
+
+            let p_set = windows_sys::Win32::System::LibraryLoader::GetProcAddress(
+                ntdll,
+                b"NtSetInformationProcess\0".as_ptr(),
+            );
+            if let Some(f_set) = p_set {
+                let nt_set: NtSetInformationProcessFn = std::mem::transmute(f_set);
+                let mut error_mode = windows_sys::Win32::System::Diagnostics::Debug::SEM_FAILCRITICALERRORS
+                    | windows_sys::Win32::System::Diagnostics::Debug::SEM_NOGPFAULTERRORBOX
+                    | windows_sys::Win32::System::Diagnostics::Debug::SEM_NOOPENFILEERRORBOX;
+                const PROCESS_DEFAULT_HARD_ERROR_MODE: u32 = 12;
+                nt_set(
+                    windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                    PROCESS_DEFAULT_HARD_ERROR_MODE,
+                    &mut error_mode as *mut _ as *const std::ffi::c_void,
+                    std::mem::size_of::<u32>() as u32,
+                );
+            }
+        }
     }
 
     // Apply process mitigation policies and anti-tamper protections (Anti-Bypass Hardening)
