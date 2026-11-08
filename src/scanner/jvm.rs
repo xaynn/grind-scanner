@@ -2,7 +2,8 @@ use crate::report::{FindingCategory, ScanFinding, ScanReport, VerdictLevel};
 use std::ffi::c_void;
 use std::mem::zeroed;
 use std::path::{Path, PathBuf};
-use windows_sys::Win32::Foundation::{CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, FILETIME, HANDLE, INVALID_HANDLE_VALUE};
+use std::io::Read;
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, Process32FirstW, Process32NextW,
     Thread32First, Thread32Next, MODULEENTRY32W, PROCESSENTRY32W, THREADENTRY32,
@@ -17,7 +18,7 @@ use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress, LoadLibraryA};
 use windows_sys::Win32::System::ProcessStatus::GetModuleFileNameExW;
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetCurrentProcessId, GetProcessId, OpenProcess, OpenThread,
+    GetCurrentProcess, GetCurrentProcessId, GetProcessId, GetProcessTimes, OpenProcess, OpenThread,
     PROCESS_QUERY_INFORMATION, PROCESS_VM_READ, THREAD_QUERY_INFORMATION,
 };
 
@@ -72,6 +73,8 @@ pub fn identify_minecraft_process(cmdline: &str) -> (bool, String) {
         || lower.contains("badlion")
         || lower.contains("feather")
         || lower.contains("dawn")
+        || lower.contains("oneclient")
+        || lower.contains("ixeris")
         || lower.contains("prismlauncher")
         || lower.contains("modrinth")
         || lower.contains("curseforge")
@@ -96,6 +99,8 @@ pub fn identify_minecraft_process(cmdline: &str) -> (bool, String) {
         "Feather Client"
     } else if lower.contains("dawn") {
         "Dawn Client"
+    } else if lower.contains("oneclient") || lower.contains("ixeris") {
+        "OneClient"
     } else if lower.contains("prismlauncher") || lower.contains("org.prismlauncher") {
         "Prism Launcher"
     } else if lower.contains("modrinth") || lower.contains("theseus") {
@@ -306,6 +311,78 @@ pub fn scan_minecraft_instance(
 }
 
 /// Scans Minecraft process with progress reporting in MB
+/// Extracts the process creation time and elapsed uptime using GetProcessTimes WinAPI
+pub fn get_process_start_time_info(handle: HANDLE) -> Option<(String, String, String)> {
+    let mut creation_time: FILETIME = unsafe { zeroed() };
+    let mut exit_time: FILETIME = unsafe { zeroed() };
+    let mut kernel_time: FILETIME = unsafe { zeroed() };
+    let mut user_time: FILETIME = unsafe { zeroed() };
+
+    let success = unsafe {
+        GetProcessTimes(
+            handle,
+            &mut creation_time,
+            &mut exit_time,
+            &mut kernel_time,
+            &mut user_time,
+        )
+    };
+
+    if success == 0 {
+        return None;
+    }
+
+    let ft: u64 = ((creation_time.dwHighDateTime as u64) << 32) | (creation_time.dwLowDateTime as u64);
+    const WINDOWS_TICK: u64 = 10_000_000;
+    const SEC_TO_UNIX_EPOCH: u64 = 11_644_473_600;
+    const TICKS_TO_UNIX_EPOCH: u64 = SEC_TO_UNIX_EPOCH * WINDOWS_TICK;
+
+    if ft < TICKS_TO_UNIX_EPOCH {
+        return None;
+    }
+
+    let ticks = ft - TICKS_TO_UNIX_EPOCH;
+    let secs = ticks / WINDOWS_TICK;
+    let nanos = (ticks % WINDOWS_TICK) * 100;
+
+    let utc_dt = chrono::DateTime::from_timestamp(secs as i64, nanos as u32)?;
+    let local_dt: chrono::DateTime<chrono::Local> = utc_dt.with_timezone(&chrono::Local);
+    let time_only = local_dt.format("%H:%M:%S").to_string();
+    let date_and_time = local_dt.format("%Y-%m-%d %H:%M:%S").to_string();
+
+    let now_secs = chrono::Utc::now().timestamp() as u64;
+    let elapsed = if now_secs >= secs { now_secs - secs } else { 0 };
+
+    let days = elapsed / 86400;
+    let hours = (elapsed % 86400) / 3600;
+    let mins = (elapsed % 3600) / 60;
+    let remaining_secs = elapsed % 60;
+
+    let elapsed_desc = if days > 0 {
+        format!("{}d {}h ago", days, hours)
+    } else if hours > 0 {
+        format!("{}h {}m ago", hours, mins)
+    } else if mins > 0 {
+        format!("{} minutes ago", mins)
+    } else {
+        format!("{} seconds ago", remaining_secs)
+    };
+
+    let uptime_desc = if days > 0 {
+        format!("{}d {}h {}m", days, hours, mins)
+    } else if hours > 0 {
+        format!("{}h {}m {}s", hours, mins, remaining_secs)
+    } else if mins > 0 {
+        format!("{}m {}s", mins, remaining_secs)
+    } else {
+        format!("{}s", remaining_secs)
+    };
+
+    let title_badge = format!("Opened {}, {}", elapsed_desc, time_only);
+
+    Some((title_badge, date_and_time, uptime_desc))
+}
+
 pub fn scan_minecraft_instance_with_progress(
     mc: &MinecraftProcess,
     yara_engine: &crate::scanner::yara_engine::YaraScannerEngine,
@@ -336,17 +413,39 @@ pub fn scan_minecraft_instance_with_progress(
             return;
         }
 
-        report.add(
-            ScanFinding::new(
-                "Active Minecraft Instance Detected",
-                FindingCategory::MinecraftRuntime,
-                VerdictLevel::Information,
-                format!("Attached to game instance: {} ({}) [{}]", mc.name, mc.path, mc.client_brand),
-            )
-            .with_evidence("PID", mc.pid.to_string())
-            .with_evidence("Client Brand", mc.client_brand.clone())
-            .with_evidence("Path", mc.path.clone()),
-        );
+        let start_info = get_process_start_time_info(handle);
+
+        let finding_name = match &start_info {
+            Some((badge, _, _)) => format!("Active Minecraft Instance Detected [{}]", badge),
+            None => "Active Minecraft Instance Detected".to_string(),
+        };
+
+        let finding_desc = match &start_info {
+            Some((_, dt, uptime)) => format!(
+                "Attached to game instance: {} ({}) [{}] - Running for {} (Started: {})",
+                mc.name, mc.path, mc.client_brand, uptime, dt
+            ),
+            None => format!("Attached to game instance: {} ({}) [{}]", mc.name, mc.path, mc.client_brand),
+        };
+
+        let mut finding = ScanFinding::new(
+            finding_name,
+            FindingCategory::MinecraftRuntime,
+            VerdictLevel::Information,
+            finding_desc,
+        )
+        .with_evidence("PID", mc.pid.to_string())
+        .with_evidence("Client Brand", mc.client_brand.clone())
+        .with_evidence("Path", mc.path.clone());
+
+        if let Some((badge, dt, uptime)) = start_info {
+            finding = finding
+                .with_evidence("Start Time (Local)", dt)
+                .with_evidence("Uptime", uptime)
+                .with_evidence("Instance Status", format!("Active ({})", badge));
+        }
+
+        report.add(finding);
 
     // 1. Inspect JVM arguments
         if let Some(cmdline) = get_process_command_line(handle) {
@@ -437,6 +536,86 @@ fn check_jvm_arguments(cmdline: &str, report: &mut ScanReport) {
     }
 }
 
+/// Identifies recognized standard Minecraft mod native libraries (JNI audio, chunking, ML)
+fn is_known_benign_mod_native(name: &str, path: &str) -> Option<&'static str> {
+    let lower_name = name.to_lowercase();
+    let lower_path = path.to_lowercase();
+
+    if lower_name.contains("c2me") {
+        return Some("C2ME (Concurrent Chunk Management Engine)");
+    }
+    if lower_name.contains("libopus4j") || (lower_name.starts_with("opus") && lower_path.contains("temp")) {
+        return Some("Opus Audio Codec (Simple Voice Chat / Plasmo Voice)");
+    }
+    if lower_name.contains("librnnoise4j") || (lower_name.starts_with("rnnoise") && lower_path.contains("temp")) {
+        return Some("RNNoise Denoising Filter (Simple Voice Chat / Plasmo Voice)");
+    }
+    if lower_name.contains("libspeex4j") || (lower_name.starts_with("speex") && lower_path.contains("temp")) {
+        return Some("SpeexDSP Acoustic Echo Cancellation (Simple Voice Chat / Plasmo Voice)");
+    }
+    if lower_name.contains("liblame4j") || lower_name.contains("lame4j") {
+        return Some("LAME MP3 Codec (Simple Voice Chat / Plasmo Voice)");
+    }
+    if lower_name.contains("onnxruntime") {
+        return Some("Microsoft ONNX Runtime (Machine Learning / Voice Model)");
+    }
+    if lower_name.contains("eos_jni") || lower_name.contains("eossdk") {
+        return Some("Epic Online Services SDK");
+    }
+    if (lower_name.starts_with("libwinpthread") || lower_name.starts_with("libgcc_s") || lower_name.starts_with("libstdc++"))
+        && (lower_path.contains(".djl.ai") || lower_path.contains("natives") || lower_path.contains("temp"))
+    {
+        return Some("GCC / MinGW C++ Runtime (Open-Source Mod Dependency)");
+    }
+    if lower_name == "tokenizers.dll" || (lower_name.contains("tokenizers") && lower_path.contains(".djl.ai")) {
+        return Some("Deep Java Library / Hugging Face Tokenizers");
+    }
+    if lower_name.contains("sqlite") || lower_name.contains("leveldb") || lower_name.contains("netty_transport") {
+        return Some("Database / Netty Native Transport");
+    }
+    None
+}
+
+/// Anti-spoofing inspection: scans an on-disk DLL file to ensure it does not contain cheat payload strings
+fn check_dll_for_embedded_cheat_strings(path: &Path) -> Option<String> {
+    if !path.is_file() {
+        return None;
+    }
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return None,
+    };
+    let mut buf = vec![0u8; 4 * 1024 * 1024];
+    let bytes_read = match file.read(&mut buf) {
+        Ok(n) => n,
+        Err(_) => return None,
+    };
+    buf.truncate(bytes_read);
+
+    let cheat_needles: &[(&str, &str)] = &[
+        ("doomsday", "Doomsday Client"),
+        ("vapeclient", "Vape Client"),
+        ("vape.gg", "Vape Client"),
+        ("kura.dll", "Kura Ghost Client"),
+        ("dclient", "DClient"),
+        ("aimassist", "AimAssist Feature"),
+        ("killaura", "KillAura Feature"),
+        ("autoclicker", "AutoClicker Feature"),
+        ("silent_aura", "SilentAura Feature"),
+        ("reach_distance", "Reach Modifier"),
+        ("unhook_jvm", "Anti-Screenshare Unhook"),
+        ("self_destruct", "Self-Destruct Routine"),
+    ];
+
+    let lower_buf = buf.to_ascii_lowercase();
+    for (needle, name) in cheat_needles {
+        if memchr::memmem::find(&lower_buf, needle.as_bytes()).is_some() {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
 fn check_loaded_modules(
     pid: u32,
     custom_strings: &[crate::scanner::custom_rules::CustomStringRule],
@@ -506,29 +685,9 @@ fn check_loaded_modules(
                     || (lower_name == "discord-rpc.dll" && lower_path.contains("discord-rpc"))
                     || (lower_name == "discord_game_sdk.dll" && lower_path.contains("discord"));
 
-                let mut is_suspicious_location = false;
-        // Detect DLLs loaded from suspicious locations (e.g. AppData\Local\Temp)
-                if lower_path.contains("\\appdata\\local\\temp\\")
-                    || lower_path.contains("\\downloads\\")
-                    || lower_path.contains("\\desktop\\")
-                {
-                    if !is_mc_native {
-                        is_suspicious_location = true;
-                        report.add(
-                            ScanFinding::new(
-                                "Suspicious Module Loaded in Javaw",
-                                FindingCategory::MinecraftRuntime,
-                                VerdictLevel::Detection,
-                                format!("DLL loaded into Minecraft from suspicious user directory: {}", mod_name),
-                            )
-                            .with_evidence("Module Name", mod_name.clone())
-                            .with_evidence("Module Path", mod_path.clone()),
-                        );
-                    }
-                }
+                let is_known_benign = is_known_benign_mod_native(&mod_name, &mod_path);
 
-                // Authenticode signature verification dla obcych bibliotek DLL
-        // Verify Windows system directory - eliminate staging folders (Temp, Tasks, Tracing)
+                // Verify Windows system directory - eliminate staging folders (Temp, Tasks, Tracing)
                 let is_windows_system = (lower_path.starts_with("c:\\windows\\system32\\")
                     || lower_path.starts_with("c:\\windows\\syswow64\\")
                     || lower_path.starts_with("c:\\windows\\winsxs\\")
@@ -556,8 +715,40 @@ fn check_loaded_modules(
                 let is_signed = path_obj.is_file() && crate::scanner::forensics::is_pe_signed(path_obj);
                 let in_volatile = crate::scanner::forensics::is_volatile_directory(&lower_path);
 
-                if is_overlay_name {
-        // Overlays must ALWAYS possess a valid publisher digital signature and cannot originate from a volatile folder!
+                if let Some(benign_tech) = is_known_benign {
+                    // Anti-spoofing check: verify that this benign-named DLL is NOT actually a cheat payload!
+                    if let Some(cheat_trigger) = check_dll_for_embedded_cheat_strings(path_obj) {
+                        report.add(
+                            ScanFinding::new(
+                                format!("Spoofed Malicious Module Masquerading as Benign Mod ({})", benign_tech),
+                                FindingCategory::MinecraftRuntime,
+                                VerdictLevel::Detection,
+                                format!(
+                                    "Module '{}' uses a known mod name ({}), but contains embedded cheat signatures: {}. Masquerading attempt detected!",
+                                    mod_name, benign_tech, cheat_trigger
+                                ),
+                            )
+                            .with_evidence("Module Name", mod_name.clone())
+                            .with_evidence("Module Path", mod_path.clone())
+                            .with_evidence("Spoofed Framework", benign_tech.to_string())
+                            .with_evidence("Cheat Trigger", cheat_trigger),
+                        );
+                    } else {
+                        // Legitimate verified mod native library
+                        report.add(
+                            ScanFinding::new(
+                                format!("Legitimate Mod Native Library: {}", mod_name),
+                                FindingCategory::MinecraftRuntime,
+                                VerdictLevel::Information,
+                                format!("Recognized standard mod native library: {} ({})", mod_name, benign_tech),
+                            )
+                            .with_evidence("Module Name", mod_name.clone())
+                            .with_evidence("Module Path", mod_path.clone())
+                            .with_evidence("Technology", benign_tech.to_string()),
+                        );
+                    }
+                } else if is_overlay_name {
+                    // Overlays must ALWAYS possess a valid publisher digital signature and cannot originate from a volatile folder!
                     if !is_signed || in_volatile {
                         report.add(
                             ScanFinding::new(
@@ -571,20 +762,49 @@ fn check_loaded_modules(
                             .with_evidence("Masqueraded Target", "Legitimate Gaming Overlay (Discord/OBS/RivaTuner/Steam)".to_string()),
                         );
                     }
-                } else if !is_suspicious_location && !is_windows_system && !is_jre && !is_mc_native {
+                } else if lower_path.contains("\\appdata\\local\\temp\\")
+                    || lower_path.contains("\\downloads\\")
+                    || lower_path.contains("\\desktop\\")
+                {
+                    if !is_mc_native {
+                        let sign_status = if is_signed {
+                            "Yes (Authenticode signature present; note that paid certificates can be acquired by cheat developers)"
+                        } else {
+                            "No (Unsigned binary)"
+                        };
+
+                        report.add(
+                            ScanFinding::new(
+                                "Suspicious Unverified Module in Javaw",
+                                FindingCategory::MinecraftRuntime,
+                                VerdictLevel::Warning,
+                                format!(
+                                    "Unverified dynamic library '{}' is loaded into Minecraft from a volatile directory ({}). Manual review recommended for screenshare inspection.",
+                                    mod_name, mod_path
+                                ),
+                            )
+                            .with_evidence("Module Name", mod_name.clone())
+                            .with_evidence("Module Path", mod_path.clone())
+                            .with_evidence("Authenticode Signed", sign_status.to_string())
+                            .with_evidence("Inspection Advice", "Inspect file properties and digital signature certificate during screenshare".to_string()),
+                        );
+                    }
+                } else if !is_windows_system && !is_jre && !is_mc_native {
                     if path_obj.is_file() && !is_signed {
                         report.add(
                             ScanFinding::new(
-                                "Unsigned Rogue Dynamic Library Injected into Minecraft",
+                                "Unsigned Foreign Dynamic Library in Javaw",
                                 FindingCategory::MinecraftRuntime,
-                                VerdictLevel::Detection,
+                                VerdictLevel::Warning,
                                 format!("Foreign unsigned dynamic library '{}' is loaded into the Minecraft process memory space.", mod_name),
                             )
                             .with_evidence("Module Name", mod_name)
-                            .with_evidence("Module Path", mod_path),
+                            .with_evidence("Module Path", mod_path)
+                            .with_evidence("Inspection Advice", "Verify whether this DLL belongs to an installed third-party mod".to_string()),
                         );
                     }
                 }
+
 
                 if Module32NextW(snapshot, &mut entry) == 0 {
                     break;
@@ -978,6 +1198,9 @@ fn is_whitelisted_mouse_class(cls: &str) -> bool {
         || clean.starts_with("net.minecraft.")
         || clean.starts_with("fi/dy/masa/")
         || clean.starts_with("me/shedaniel/")
+        // Specifically whitelist OneClient legitimate MouseHandlerAccessor
+        || clean == "me/decce/ixeris/mixins/MouseHandlerAccessor"
+        || clean == "me.decce.ixeris.mixins.MouseHandlerAccessor"
 }
 
 /// Scans memory buffer for unauthorized Mixins modifying sensitive game mechanics
@@ -1079,14 +1302,9 @@ struct CheatPatternRule {
 
 /// Scans Minecraft process memory (MEM_PRIVATE) using highly optimized Aho-Corasick automaton
 /// and selective YARA rule engine for executable pages and suspicious memory fragments.
-fn scan_memory_strings(
-    handle: HANDLE,
-    yara_engine: &crate::scanner::yara_engine::YaraScannerEngine,
-    custom_strings: &[crate::scanner::custom_rules::CustomStringRule],
-    report: &mut ScanReport,
-    on_mb: &dyn Fn(usize),
-) {
-    let rules = [
+/// Returns the static slice of built-in cheat patterns for memory inspection
+fn get_builtin_cheat_patterns() -> &'static [CheatPatternRule] {
+    &[
         // --- GHOST CLIENTS & INJECTORS ---
         CheatPatternRule { pattern: "doomsdayclient", name: "Doomsday Ghost Client Core", description: "Wykryto moduł główny Doomsday Client w procesie javaw.", level: VerdictLevel::Detection },
         CheatPatternRule { pattern: "DoomsdayClient", name: "Doomsday Ghost Client Main", description: "Wykryto klasę rozruchową DoomsdayClient w procesie javaw.", level: VerdictLevel::Detection },
@@ -1359,16 +1577,18 @@ fn scan_memory_strings(
         CheatPatternRule { pattern: "modules/combat/AutoWTap", name: "Movement: AutoWTap Path", description: "Wykryto ścieżkę modułu AutoWTap.", level: VerdictLevel::Detection },
         CheatPatternRule { pattern: "WTap Delay", name: "Movement: WTap Delay Setting", description: "Wykryto parametr opóźnienia modułu WTap.", level: VerdictLevel::Detection },
         CheatPatternRule { pattern: "W-Tap Delay", name: "Movement: W-Tap Delay Setting", description: "Wykryto parametr opóźnienia modułu W-Tap.", level: VerdictLevel::Detection },
+        CheatPatternRule { pattern: "wtap_delay", name: "Movement: WTap Delay Config", description: "Wykryto parametr konfiguracyjny wtap_delay.", level: VerdictLevel::Detection },
+        CheatPatternRule { pattern: "w-tap_delay", name: "Movement: W-Tap Delay Config", description: "Wykryto parametr konfiguracyjny w-tap_delay.", level: VerdictLevel::Detection },
         CheatPatternRule { pattern: "WTap Chance", name: "Movement: WTap Chance Setting", description: "Wykryto parametr szansy modułu WTap.", level: VerdictLevel::Detection },
         CheatPatternRule { pattern: "W-Tap Chance", name: "Movement: W-Tap Chance Setting", description: "Wykryto parametr szansy modułu W-Tap.", level: VerdictLevel::Detection },
+        CheatPatternRule { pattern: "wtap_chance", name: "Movement: WTap Chance Config", description: "Wykryto parametr konfiguracyjny wtap_chance.", level: VerdictLevel::Detection },
+        CheatPatternRule { pattern: "w-tap_chance", name: "Movement: W-Tap Chance Config", description: "Wykryto parametr konfiguracyjny w-tap_chance.", level: VerdictLevel::Detection },
         CheatPatternRule { pattern: "WTap Mode", name: "Movement: WTap Mode Setting", description: "Wykryto parametr trybu modułu WTap.", level: VerdictLevel::Detection },
         CheatPatternRule { pattern: "W-Tap Mode", name: "Movement: W-Tap Mode Setting", description: "Wykryto parametr trybu modułu W-Tap.", level: VerdictLevel::Detection },
         CheatPatternRule { pattern: "WTapPacket", name: "Movement: WTap Packet Hook", description: "Wykryto pakietowy mechanizm WTapPacket.", level: VerdictLevel::Detection },
         CheatPatternRule { pattern: "PacketWTap", name: "Movement: PacketWTap Hook", description: "Wykryto pakietowy mechanizm PacketWTap.", level: VerdictLevel::Detection },
-        CheatPatternRule { pattern: "modules/movement/WTap", name: "Movement: WTap Module Path", description: "Wykryto ścieżkę modułu WTap w strukturze cheata.", level: VerdictLevel::Detection },
-        CheatPatternRule { pattern: "modules/WTap", name: "Movement: WTap Module Path", description: "Wykryto ścieżkę modułu WTap.", level: VerdictLevel::Detection },
-        CheatPatternRule { pattern: "WTap.class", name: "Movement: WTap Class File", description: "Wykryto skompilowaną klasę cheata WTap.class.", level: VerdictLevel::Detection },
-        CheatPatternRule { pattern: "W-Tap.class", name: "Movement: W-Tap Class File", description: "Wykryto skompilowaną klasę cheata W-Tap.class.", level: VerdictLevel::Detection },
+        CheatPatternRule { pattern: "modules/movement/AutoWTap", name: "Movement: AutoWTap Path", description: "Wykryto ścieżkę modułu AutoWTap.", level: VerdictLevel::Detection },
+        CheatPatternRule { pattern: "modules/combat/AutoWTap", name: "Movement: AutoWTap Path", description: "Wykryto ścieżkę modułu AutoWTap.", level: VerdictLevel::Detection },
         CheatPatternRule { pattern: "AutoBlock.class", name: "Combat: AutoBlock Class", description: "Wykryto skompilowaną klasę AutoBlock.class.", level: VerdictLevel::Detection },
         CheatPatternRule { pattern: "Auto-Block.class", name: "Combat: Auto-Block Class", description: "Wykryto skompilowaną klasę Auto-Block.class.", level: VerdictLevel::Detection },
         CheatPatternRule { pattern: "AutoBlock.java", name: "Combat: AutoBlock Source", description: "Wykryto plik źródłowy AutoBlock.java.", level: VerdictLevel::Detection },
@@ -1420,14 +1640,6 @@ fn scan_memory_strings(
         CheatPatternRule { pattern: "Unhook JVM", name: "Anti-Forensics: Unhook JVM", description: "Wykryto próbę odpięcia hooków JVM przed screenshare.", level: VerdictLevel::Detection },
 
         // --- GENERIC CHEAT ARCHITECTURE & FRAMEWORKS (0-day / Custom Clients) ---
-        CheatPatternRule { pattern: "modules/combat/", name: "Generic Architecture: modules/combat/", description: "Wykryto uniwersalną ścieżkę pakietu modułów bojowych cheata.", level: VerdictLevel::Detection },
-        CheatPatternRule { pattern: "modules/movement/", name: "Generic Architecture: modules/movement/", description: "Wykryto uniwersalną ścieżkę pakietu modułów ruchu cheata.", level: VerdictLevel::Detection },
-        CheatPatternRule { pattern: "modules/render/", name: "Generic Architecture: modules/render/", description: "Wykryto uniwersalną ścieżkę pakietu modułów renderowania/ESP cheata.", level: VerdictLevel::Detection },
-        CheatPatternRule { pattern: "modules/player/", name: "Generic Architecture: modules/player/", description: "Wykryto uniwersalną ścieżkę pakietu modułów gracza cheata.", level: VerdictLevel::Detection },
-        CheatPatternRule { pattern: "Category;->COMBAT", name: "Generic Cheat Enum: Category.COMBAT", description: "Wykryto odwołanie do enumu kategorii bojowej Category.COMBAT.", level: VerdictLevel::Detection },
-        CheatPatternRule { pattern: "Category;->MOVEMENT", name: "Generic Cheat Enum: Category.MOVEMENT", description: "Wykryto odwołanie do enumu kategorii ruchu Category.MOVEMENT.", level: VerdictLevel::Detection },
-        CheatPatternRule { pattern: "Category/COMBAT", name: "Generic Cheat Enum: Category/COMBAT", description: "Wykryto deklarację stałej COMBAT w enumie Category cheata.", level: VerdictLevel::Detection },
-        CheatPatternRule { pattern: "Category/MOVEMENT", name: "Generic Cheat Enum: Category/MOVEMENT", description: "Wykryto deklarację stałej MOVEMENT w enumie Category cheata.", level: VerdictLevel::Detection },
         CheatPatternRule { pattern: "me.darkmagician6.eventapi", name: "Generic Cheat Framework: DarkMagician6 EventAPI", description: "Wykryto uniwersalny framework zdarzeń (EventAPI) stosowany w większości cheatów.", level: VerdictLevel::Detection },
         CheatPatternRule { pattern: "me/darkmagician6/eventapi", name: "Generic Cheat Framework: DarkMagician6 EventAPI", description: "Wykryto uniwersalny framework zdarzeń (EventAPI) stosowany w większości cheatów.", level: VerdictLevel::Detection },
         CheatPatternRule { pattern: "me/zero/alpine", name: "Generic Cheat Framework: Alpine EventBus", description: "Wykryto framework szyny zdarzeń Alpine stosowany w zaawansowanych cheatach (Meteor/BleachHack).", level: VerdictLevel::Detection },
@@ -1448,7 +1660,19 @@ fn scan_memory_strings(
         CheatPatternRule { pattern: "net/java/s.class", name: "Doomsday Class (s.class)", description: "Wykryto wstrzykniętą klasę Doomsday net/java/s.class.", level: VerdictLevel::Detection },
         CheatPatternRule { pattern: "net/java/t.class", name: "Doomsday Class (t.class)", description: "Wykryto wstrzykniętą klasę Doomsday net/java/t.class.", level: VerdictLevel::Detection },
         CheatPatternRule { pattern: "net/java/y.class", name: "Doomsday Class (y.class)", description: "Wykryto wstrzykniętą klasę Doomsday net/java/y.class.", level: VerdictLevel::Detection },
-    ];
+    ]
+}
+
+/// Scans Minecraft process memory (MEM_PRIVATE) using highly optimized Aho-Corasick automaton
+/// and selective YARA rule engine for executable pages and suspicious memory fragments.
+fn scan_memory_strings(
+    handle: HANDLE,
+    yara_engine: &crate::scanner::yara_engine::YaraScannerEngine,
+    custom_strings: &[crate::scanner::custom_rules::CustomStringRule],
+    report: &mut ScanReport,
+    on_mb: &dyn Fn(usize),
+) {
+    let rules = get_builtin_cheat_patterns();
 
     struct ActivePatternRule<'a> {
         pattern: &'a str,
@@ -2524,6 +2748,12 @@ mod tests {
         assert!(is_mc);
         assert_eq!(brand, "Dawn Client");
 
+        // OneClient
+        let oneclient_cmd = r#""C:\Java\bin\javaw.exe" -Doneclient.version=1.0 me.decce.ixeris.Main net.minecraft.client.main.Main"#;
+        let (is_mc, brand) = identify_minecraft_process(oneclient_cmd);
+        assert!(is_mc);
+        assert_eq!(brand, "OneClient");
+
     // Gradle Daemon (should be rejected as non-Minecraft)
         let gradle_cmd = r#""C:\Java\bin\java.exe" -classpath org.gradle.launcher.daemon.bootstrap.GradleDaemon"#;
         let (is_mc, _) = identify_minecraft_process(gradle_cmd);
@@ -2590,6 +2820,113 @@ mod tests {
             assert!(finder.find(sample).is_some(), "Pattern {} must be found in sample", pattern);
         }
     }
+    #[test]
+    fn test_oneclient_false_positive_elimination_and_zero_trust() {
+        // 1. OneClient MouseHandlerAccessor is legitimately whitelisted
+        assert!(is_whitelisted_mouse_class("me/decce/ixeris/mixins/MouseHandlerAccessor"));
+        assert!(is_whitelisted_mouse_class("me.decce.ixeris.mixins.MouseHandlerAccessor"));
+        assert!(is_whitelisted_mouse_class("Lme/decce/ixeris/mixins/MouseHandlerAccessor;"));
+
+        // 2. Zero-trust: spoofed malicious mixins in me/decce/ixeris are NOT whitelisted
+        assert!(!is_whitelisted_mouse_class("me/decce/ixeris/mixins/AutoClickerAccessor"));
+        assert!(!is_whitelisted_mixin_class("me/decce/ixeris/mixins/EndCrystalItemMixin"));
+        assert!(!is_whitelisted_mixin_class("me/decce/ixeris/mixins/ClientPlayerInteractionManagerMixin"));
+
+        // 3. Verify pattern rules do not contain bare WTap.class or Category/MOVEMENT
+        let patterns = get_builtin_cheat_patterns();
+        for rule in patterns {
+            assert_ne!(rule.pattern, "WTap.class", "Bare WTap.class must not be a cheat rule");
+            assert_ne!(rule.pattern, "W-Tap.class", "Bare W-Tap.class must not be a cheat rule");
+            assert_ne!(rule.pattern, "Category/MOVEMENT", "Category/MOVEMENT must not be a cheat rule");
+            assert_ne!(rule.pattern, "Category/COMBAT", "Category/COMBAT must not be a cheat rule");
+        }
+
+        // 4. Verify that real cheat automation patterns ARE present
+        assert!(patterns.iter().any(|r| r.pattern == "AutoWTap.class"));
+        assert!(patterns.iter().any(|r| r.pattern == "WTap Delay"));
+        assert!(patterns.iter().any(|r| r.pattern == "wtap_chance"));
+        assert!(patterns.iter().any(|r| r.pattern == "WTapPacket"));
+    }
+
+    #[test]
+    fn test_benign_mod_natives_and_anti_spoofing() {
+        println!("\n=== [TEST] Starting Benign Mod Natives & Anti-Spoofing Verification ===");
+
+        // 1. Legitimate mod natives are recognized
+        let c2me = is_known_benign_mod_native("c2me-opts-natives-math.dll", r"C:\Users\user\AppData\Local\Temp\c2me-opts-natives-math.dll");
+        println!("[1] Testing C2ME: {:?}", c2me);
+        assert!(c2me.is_some());
+
+        let opus = is_known_benign_mod_native("libopus4j.dll", r"C:\Users\user\AppData\Local\Temp\libopus4j\libopus4j.dll");
+        println!("[2] Testing libopus4j: {:?}", opus);
+        assert!(opus.is_some());
+
+        let rnnoise = is_known_benign_mod_native("librnnoise4j.dll", r"C:\Users\user\AppData\Local\Temp\librnnoise4j.dll");
+        println!("[3] Testing librnnoise4j: {:?}", rnnoise);
+        assert!(rnnoise.is_some());
+
+        let onnx = is_known_benign_mod_native("onnxruntime.dll", r"C:\Users\user\AppData\Local\Temp\onnxruntime.dll");
+        println!("[4] Testing onnxruntime: {:?}", onnx);
+        assert!(onnx.is_some());
+
+        let eos = is_known_benign_mod_native("EOSSDK-Win64-Shipping.dll", r"C:\Users\user\AppData\Local\Temp\EOSSDK-Win64-Shipping.dll");
+        println!("[5] Testing EOSSDK: {:?}", eos);
+        assert!(eos.is_some());
+
+        let tokenizers = is_known_benign_mod_native("tokenizers.dll", r"C:\Users\user\.djl.ai\tokenizers\tokenizers.dll");
+        println!("[6] Testing tokenizers: {:?}", tokenizers);
+        assert!(tokenizers.is_some());
+
+        let winpthread = is_known_benign_mod_native("libwinpthread-1.dll", r"C:\Users\user\.djl.ai\tokenizers\libwinpthread-1.dll");
+        println!("[7] Testing libwinpthread: {:?}", winpthread);
+        assert!(winpthread.is_some());
+
+        // 2. Unknown cheat DLL is NOT recognized as benign
+        let cheat = is_known_benign_mod_native("my_cheat.dll", r"C:\Users\user\AppData\Local\Temp\my_cheat.dll");
+        println!("[8] Testing cheat DLL (my_cheat.dll): {:?}", cheat);
+        assert!(cheat.is_none());
+
+        let kura = is_known_benign_mod_native("kura.dll", r"C:\Users\user\AppData\Local\Temp\kura.dll");
+        println!("[9] Testing known cheat binary (kura.dll): {:?}", kura);
+        assert!(kura.is_none());
+
+        // 3. Anti-spoofing: if a cheat names itself c2me.dll but contains cheat payload strings, it is DETECTED!
+        let temp_dir = std::env::temp_dir().join("test_dll_spoof");
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        let clean_c2me = temp_dir.join("clean_c2me.dll");
+        let _ = std::fs::write(&clean_c2me, b"Standard legitimate math chunk optimization bytecode");
+        let clean_check = check_dll_for_embedded_cheat_strings(&clean_c2me);
+        println!("[10] Anti-spoofing on legitimate clean C2ME DLL -> result: {:?} (Clean)", clean_check);
+        assert!(clean_check.is_none());
+
+        let fake_c2me = temp_dir.join("fake_c2me.dll");
+        let _ = std::fs::write(&fake_c2me, b"Fake header ... killaura and aimassist ... fake footer");
+        let trigger = check_dll_for_embedded_cheat_strings(&fake_c2me);
+        println!("[11] Anti-spoofing on SPOOFED C2ME DLL (contains cheat strings) -> DETECTED TRIGGER: {:?}", trigger);
+        assert!(trigger.is_some(), "Spoofed DLL containing cheat strings must be detected!");
+
+        let _ = std::fs::remove_file(&clean_c2me);
+        let _ = std::fs::remove_file(&fake_c2me);
+        let _ = std::fs::remove_dir(&temp_dir);
+        println!("=== [TEST] Benign Mod Natives & Anti-Spoofing Passed Successfully! ===\n");
+    }
+
+    #[test]
+    fn test_get_process_start_time_info_on_current_process() {
+        unsafe {
+            let handle = GetCurrentProcess();
+            let result = get_process_start_time_info(handle);
+            assert!(result.is_some(), "GetCurrentProcess must return valid start time info");
+            let (badge, date_and_time, uptime) = result.unwrap();
+            println!("\n=== [TEST] Process Start Time WinAPI Output ===");
+            println!("Finding Title: Active Minecraft Instance Detected [{}]", badge);
+            println!("Start Date & Time (Local): {}", date_and_time);
+            println!("Uptime: {}", uptime);
+            println!("=== [TEST] End Process Start Time Verification ===\n");
+            assert!(badge.contains("Opened"));
+            assert!(!date_and_time.is_empty());
+            assert!(!uptime.is_empty());
+        }
+    }
 }
-
-
