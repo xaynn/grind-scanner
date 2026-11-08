@@ -10,7 +10,7 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     TH32CS_SNAPMODULE, TH32CS_SNAPMODULE32, TH32CS_SNAPPROCESS, TH32CS_SNAPTHREAD,
 };
 use windows_sys::Win32::System::Memory::{
-    VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_PRIVATE,
+    VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_MAPPED, MEM_PRIVATE,
     PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY,
     PAGE_READONLY, PAGE_READWRITE,
 };
@@ -133,6 +133,46 @@ pub fn identify_minecraft_process(cmdline: &str) -> (bool, String) {
 }
 
 /// Finds active Minecraft instances (strictly javaw.exe or java.exe)
+/// Fallback check: inspects loaded modules of a process to verify presence of jvm.dll and lwjgl/glfw/openal
+/// Used when PEB command line has been wiped or binary was renamed.
+fn check_process_has_jvm_and_lwjgl(pid: u32) -> (bool, bool) {
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+        if snap == INVALID_HANDLE_VALUE {
+            return (false, false);
+        }
+        let mut entry: MODULEENTRY32W = zeroed();
+        entry.dwSize = std::mem::size_of::<MODULEENTRY32W>() as u32;
+        let mut has_jvm = false;
+        let mut has_lwjgl = false;
+        if Module32FirstW(snap, &mut entry) != 0 {
+            loop {
+                let mod_name = String::from_utf16_lossy(
+                    &entry.szModule[..entry
+                        .szModule
+                        .iter()
+                        .position(|&c| c == 0)
+                        .unwrap_or(entry.szModule.len())],
+                ).to_lowercase();
+                if mod_name == "jvm.dll" {
+                    has_jvm = true;
+                }
+                if mod_name.contains("lwjgl") || mod_name.contains("glfw") || mod_name.contains("openal") {
+                    has_lwjgl = true;
+                }
+                if has_jvm && has_lwjgl {
+                    break;
+                }
+                if Module32NextW(snap, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snap);
+        (has_jvm, has_lwjgl)
+    }
+}
+
 pub fn find_minecraft_processes() -> Vec<MinecraftProcess> {
     let mut results = Vec::new();
     unsafe {
@@ -155,8 +195,15 @@ pub fn find_minecraft_processes() -> Vec<MinecraftProcess> {
                 );
 
                 let lower_name = name.to_lowercase();
-                if lower_name == "javaw.exe" || lower_name == "java.exe" {
-                    // Try to inspect process path to confirm
+                let is_candidate = lower_name == "javaw.exe"
+                    || lower_name == "java.exe"
+                    || lower_name.contains("minecraft")
+                    || lower_name.contains("lunar")
+                    || lower_name.contains("badlion")
+                    || lower_name.contains("feather")
+                    || lower_name.contains("prismlauncher");
+
+                if is_candidate {
                     let handle = OpenProcess(
                         PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
                         0,
@@ -174,16 +221,38 @@ pub fn find_minecraft_processes() -> Vec<MinecraftProcess> {
                         CloseHandle(handle);
                     }
 
+                    let mut matched_mc = false;
+                    let mut final_brand = String::new();
+
                     if let Some(ref cmd) = cmdline_opt {
                         let (is_mc, brand) = identify_minecraft_process(cmd);
                         if is_mc {
-                            results.push(MinecraftProcess {
-                                pid: entry.th32ProcessID,
-                                name,
-                                path,
-                                client_brand: brand,
-                            });
+                            matched_mc = true;
+                            final_brand = brand;
                         }
+                    }
+
+                    // Fallback for PEB Command Line clearing / anti-forensic wiped buffer:
+                    // Inspect loaded modules for jvm.dll and lwjgl/glfw/openal
+                    if !matched_mc {
+                        let (has_jvm, has_lwjgl) = check_process_has_jvm_and_lwjgl(entry.th32ProcessID);
+                        if has_jvm && has_lwjgl {
+                            matched_mc = true;
+                            final_brand = if cmdline_opt.is_none() || cmdline_opt.as_ref().map(|s| s.trim().is_empty()).unwrap_or(false) {
+                                "Minecraft (Cloaked / PEB CommandLine Cleared)".to_string()
+                            } else {
+                                "Minecraft (Active JVM Runtime)".to_string()
+                            };
+                        }
+                    }
+
+                    if matched_mc {
+                        results.push(MinecraftProcess {
+                            pid: entry.th32ProcessID,
+                            name,
+                            path,
+                            client_brand: final_brand,
+                        });
                     }
                 }
 
@@ -844,32 +913,60 @@ fn check_memory_regions(handle: HANDLE, report: &mut ScanReport) {
                         rwx_count += 1;
                     }
 
-        // Detect unbacked memory (MEM_PRIVATE instead of MEM_IMAGE)
-        // Legitimate DLLs are MEM_IMAGE. Code injected via Manual Map is MEM_PRIVATE!
-                    if mbi.Type == MEM_PRIVATE {
-        // Check if this unbacked region contains a PE header ("MZ" = 0x4D, 0x5A)
-                        let mut header_buf = [0u8; 2];
+        // Detect unbacked or section-mapped memory (MEM_PRIVATE or MEM_MAPPED instead of MEM_IMAGE)
+        // Legitimate DLLs are MEM_IMAGE. Code injected via Manual Map or Section Mapping is MEM_PRIVATE / MEM_MAPPED!
+                    if mbi.Type == MEM_PRIVATE || mbi.Type == MEM_MAPPED {
+                        let mut header_buf = [0u8; 1024];
                         let mut bytes_read = 0;
                         if windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory(
                             handle,
                             mbi.BaseAddress,
                             header_buf.as_mut_ptr() as *mut c_void,
-                            2,
+                            header_buf.len(),
                             &mut bytes_read,
-                        ) != 0
+                        ) != 0 && bytes_read >= 2
                         {
-                            if header_buf == [0x4D, 0x5A] {
+                            let has_mz = header_buf[0] == 0x4D && header_buf[1] == 0x5A;
+                            let mut has_wiped_pe = false;
+
+                            if !has_mz && bytes_read >= 64 {
+                                // If MZ was zeroed out (e.g. RtlZeroMemory on DOS header), check e_lfanew or PE signature
+                                let e_lfanew = u32::from_le_bytes(header_buf[0x3C..0x40].try_into().unwrap_or([0; 4])) as usize;
+                                if e_lfanew > 0 && e_lfanew + 4 <= bytes_read {
+                                    if &header_buf[e_lfanew..e_lfanew + 4] == b"PE\0\0" {
+                                        has_wiped_pe = true;
+                                    }
+                                }
+                                if !has_wiped_pe {
+                                    for window in header_buf[..bytes_read].windows(8) {
+                                        if window == b".text\0\0\0" || window == b".rdata\0\0" || window == b".data\0\0\0" {
+                                            has_wiped_pe = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+
+                            if has_mz || has_wiped_pe {
                                 unbacked_pe_count += 1;
+                                let mem_type_str = if mbi.Type == MEM_PRIVATE { "MEM_PRIVATE (Unbacked)" } else { "MEM_MAPPED (Section View)" };
+                                let (title, desc) = if has_mz {
+                                    ("Manual Mapped PE Header in javaw.exe", "Detected reflective/manual-mapped PE (DLL/EXE) residing in unbacked memory.")
+                                } else {
+                                    ("Manual Mapped PE with Wiped Header in javaw.exe", "Detected manual-mapped PE with zeroed/tampered DOS MZ header (Anti-Analysis Manual Map evasion).")
+                                };
                                 report.add(
                                     ScanFinding::new(
-                                        "Manual Mapped PE Header in javaw.exe",
+                                        title,
                                         FindingCategory::MemoryInspection,
                                         VerdictLevel::Detection,
-                                        "Detected reflective/manual-mapped PE (DLL/EXE) residing in unbacked private memory.",
+                                        desc,
                                     )
                                     .with_evidence("Base Address", format!("0x{:X}", mbi.BaseAddress as usize))
                                     .with_evidence("Region Size", format!("{} KB", mbi.RegionSize / 1024))
-                                    .with_evidence("Protection", format!("0x{:X}", mbi.Protect)),
+                                    .with_evidence("Protection", format!("0x{:X}", mbi.Protect))
+                                    .with_evidence("Memory Type", mem_type_str.to_string())
+                                    .with_evidence("Header State", if has_mz { "MZ Signature Present".to_string() } else { "MZ Wiped / PE Remnants Detected".to_string() }),
                                 );
                             }
                         }
@@ -962,7 +1059,7 @@ fn check_floating_threads(handle: HANDLE, pid: u32, report: &mut ScanReport) {
                                     || mbi.Protect == PAGE_EXECUTE_READWRITE
                                     || mbi.Protect == PAGE_EXECUTE_WRITECOPY;
 
-                                if mbi.State == MEM_COMMIT && mbi.Type == MEM_PRIVATE && is_exec {
+                                if mbi.State == MEM_COMMIT && (mbi.Type == MEM_PRIVATE || mbi.Type == MEM_MAPPED) && is_exec {
                                     report.add(
                                         ScanFinding::new(
                                             "Injected Floating Thread Detected",
@@ -972,13 +1069,75 @@ fn check_floating_threads(handle: HANDLE, pid: u32, report: &mut ScanReport) {
                                         )
                                         .with_evidence("Thread ID", te.th32ThreadID.to_string())
                                         .with_evidence("Start Address", format!("0x{:X}", start_addr))
-                                        .with_evidence("Memory Type", "MEM_PRIVATE (Unbacked)")
+                                        .with_evidence("Memory Type", if mbi.Type == MEM_PRIVATE { "MEM_PRIVATE (Unbacked)" } else { "MEM_MAPPED" })
                                         .with_evidence("Memory Protection", format!("0x{:X}", mbi.Protect))
                                         .with_evidence("Allocation Base", format!("0x{:X}", mbi.AllocationBase as usize)),
                                     );
                                 }
                             }
                         }
+
+                        // Thread Hijacking Detection: Check current instruction pointer (RIP/EIP)
+                        let h_thread_ctx = OpenThread(
+                            0x0040 /* THREAD_QUERY_INFORMATION */ | 0x0008 /* THREAD_GET_CONTEXT */ | 0x0002 /* THREAD_SUSPEND_RESUME */,
+                            0,
+                            te.th32ThreadID,
+                        );
+                        if !h_thread_ctx.is_null() {
+                            let suspend_count = windows_sys::Win32::System::Threading::SuspendThread(h_thread_ctx);
+                            if suspend_count != u32::MAX {
+                                #[repr(C, align(16))]
+                                struct AlignedContext {
+                                    ctx: windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
+                                }
+                                let mut aligned: AlignedContext = zeroed();
+                                aligned.ctx.ContextFlags = 0x00100000 | 0x00000002; // CONTEXT_CONTROL
+                                if windows_sys::Win32::System::Diagnostics::Debug::GetThreadContext(h_thread_ctx, &mut aligned.ctx) != 0 {
+                                    #[cfg(target_arch = "x86_64")]
+                                    let ip = aligned.ctx.Rip as usize;
+                                    #[cfg(not(target_arch = "x86_64"))]
+                                    let ip = aligned.ctx.Eip as usize;
+
+                                    if ip != 0 && ip != start_addr {
+                                        let mut mbi_ip: MEMORY_BASIC_INFORMATION = zeroed();
+                                        if VirtualQueryEx(
+                                            handle,
+                                            ip as *const c_void,
+                                            &mut mbi_ip,
+                                            std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+                                        ) != 0 {
+                                            let is_exec = mbi_ip.Protect == PAGE_EXECUTE
+                                                || mbi_ip.Protect == PAGE_EXECUTE_READ
+                                                || mbi_ip.Protect == PAGE_EXECUTE_READWRITE
+                                                || mbi_ip.Protect == PAGE_EXECUTE_WRITECOPY;
+                                            if mbi_ip.State == MEM_COMMIT
+                                                && (mbi_ip.Type == MEM_PRIVATE || mbi_ip.Type == MEM_MAPPED)
+                                                && is_exec
+                                                && mbi_ip.RegionSize < 8 * 1024 * 1024
+                                            {
+                                                report.add(
+                                                    ScanFinding::new(
+                                                        "Hijacked Thread Executing in Unbacked Memory",
+                                                        FindingCategory::MemoryInspection,
+                                                        VerdictLevel::Detection,
+                                                        "Detected active thread with hijacked execution pointer (RIP/EIP) executing in unbacked private memory outside legitimate modules. Universal signature of SetThreadContext hijacking.",
+                                                    )
+                                                    .with_evidence("Thread ID", te.th32ThreadID.to_string())
+                                                    .with_evidence("Current Instruction Pointer", format!("0x{:X}", ip))
+                                                    .with_evidence("Thread Start Address", format!("0x{:X}", start_addr))
+                                                    .with_evidence("Memory Type", if mbi_ip.Type == MEM_PRIVATE { "MEM_PRIVATE (Unbacked)" } else { "MEM_MAPPED" })
+                                                    .with_evidence("Region Size", format!("{} KB", mbi_ip.RegionSize / 1024))
+                                                    .with_evidence("Technique", "Thread Hijacking (SetThreadContext)".to_string()),
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                windows_sys::Win32::System::Threading::ResumeThread(h_thread_ctx);
+                            }
+                            CloseHandle(h_thread_ctx);
+                        }
+
                         CloseHandle(h_thread);
                     }
                 }
@@ -989,6 +1148,135 @@ fn check_floating_threads(handle: HANDLE, pid: u32, report: &mut ScanReport) {
             }
         }
         CloseHandle(snapshot);
+    }
+}
+
+/// Resolves a procedure address from a remote process module's PE export table in memory.
+/// This avoids calling LoadLibrary on untrusted/unsigned third-party DLLs from game instances
+/// which causes Windows "Bad Image / 0xc0000428" modal error dialogs or unwanted DllMain execution.
+pub fn get_remote_proc_address(handle: HANDLE, module_base: usize, proc_name: &str) -> Option<usize> {
+    unsafe {
+        let mut e_lfanew = 0u32;
+        let mut bytes_read = 0usize;
+        if ReadProcessMemory(
+            handle,
+            (module_base + 0x3C) as *const c_void,
+            &mut e_lfanew as *mut _ as *mut c_void,
+            4,
+            &mut bytes_read,
+        ) == 0 || bytes_read != 4 || e_lfanew == 0 || e_lfanew > 0x1000 {
+            return None;
+        }
+
+        let nt_header = module_base + e_lfanew as usize;
+        let mut pe_sig = [0u8; 4];
+        if ReadProcessMemory(
+            handle,
+            nt_header as *const c_void,
+            pe_sig.as_mut_ptr() as *mut c_void,
+            4,
+            &mut bytes_read,
+        ) == 0 || &pe_sig != b"PE\0\0" {
+            return None;
+        }
+
+        let opt_header = nt_header + 24;
+        let mut magic = 0u16;
+        if ReadProcessMemory(
+            handle,
+            opt_header as *const c_void,
+            &mut magic as *mut _ as *mut c_void,
+            2,
+            &mut bytes_read,
+        ) == 0 {
+            return None;
+        }
+
+        let export_dir_offset = if magic == 0x20B { 112 } else if magic == 0x10B { 96 } else { return None; };
+        let mut export_rva = 0u32;
+        if ReadProcessMemory(
+            handle,
+            (opt_header + export_dir_offset) as *const c_void,
+            &mut export_rva as *mut _ as *mut c_void,
+            4,
+            &mut bytes_read,
+        ) == 0 || export_rva == 0 {
+            return None;
+        }
+
+        let export_dir_addr = module_base + export_rva as usize;
+        let mut export_dir_buf = [0u8; 40];
+        if ReadProcessMemory(
+            handle,
+            export_dir_addr as *const c_void,
+            export_dir_buf.as_mut_ptr() as *mut c_void,
+            export_dir_buf.len(),
+            &mut bytes_read,
+        ) == 0 || bytes_read < 40 {
+            return None;
+        }
+
+        let num_names = u32::from_le_bytes(export_dir_buf[0x18..0x1C].try_into().ok()?) as usize;
+        let addr_functions_rva = u32::from_le_bytes(export_dir_buf[0x1C..0x20].try_into().ok()?) as usize;
+        let addr_names_rva = u32::from_le_bytes(export_dir_buf[0x20..0x24].try_into().ok()?) as usize;
+        let addr_ordinals_rva = u32::from_le_bytes(export_dir_buf[0x24..0x28].try_into().ok()?) as usize;
+
+        if num_names == 0 || num_names > 20000 {
+            return None;
+        }
+
+        let mut names_rvas = vec![0u32; num_names];
+        if ReadProcessMemory(
+            handle,
+            (module_base + addr_names_rva) as *const c_void,
+            names_rvas.as_mut_ptr() as *mut c_void,
+            num_names * 4,
+            &mut bytes_read,
+        ) == 0 {
+            return None;
+        }
+
+        let mut ordinals = vec![0u16; num_names];
+        if ReadProcessMemory(
+            handle,
+            (module_base + addr_ordinals_rva) as *const c_void,
+            ordinals.as_mut_ptr() as *mut c_void,
+            num_names * 2,
+            &mut bytes_read,
+        ) == 0 {
+            return None;
+        }
+
+        for i in 0..num_names {
+            let name_rva = names_rvas[i] as usize;
+            let mut name_buf = [0u8; 64];
+            if ReadProcessMemory(
+                handle,
+                (module_base + name_rva) as *const c_void,
+                name_buf.as_mut_ptr() as *mut c_void,
+                name_buf.len(),
+                &mut bytes_read,
+            ) != 0 && bytes_read > 0 {
+                let end = name_buf.iter().position(|&b| b == 0).unwrap_or(bytes_read);
+                if let Ok(s) = std::str::from_utf8(&name_buf[..end]) {
+                    if s == proc_name {
+                        let ord = ordinals[i] as usize;
+                        let mut func_rva = 0u32;
+                        if ReadProcessMemory(
+                            handle,
+                            (module_base + addr_functions_rva + ord * 4) as *const c_void,
+                            &mut func_rva as *mut _ as *mut c_void,
+                            4,
+                            &mut bytes_read,
+                        ) != 0 && func_rva != 0 {
+                            return Some(module_base + func_rva as usize);
+                        }
+                    }
+                }
+            }
+        }
+
+        None
     }
 }
 
@@ -1005,6 +1293,7 @@ fn check_graphics_pipeline_hooks(handle: HANDLE, pid: u32, report: &mut ScanRepo
         entry.dwSize = std::mem::size_of::<MODULEENTRY32W>() as u32;
 
         let mut opengl_base = None;
+        let mut glfw_info: Option<(usize, String)> = None;
         let mut loaded_dll_ranges: Vec<(usize, usize, String, String)> = Vec::new();
 
         if Module32FirstW(snapshot, &mut entry) != 0 {
@@ -1020,10 +1309,13 @@ fn check_graphics_pipeline_hooks(handle: HANDLE, pid: u32, report: &mut ScanRepo
                 let mod_path = String::from_utf16_lossy(&entry.szExePath[..path_len]);
                 let base = entry.modBaseAddr as usize;
                 let size = entry.modBaseSize as usize;
-                loaded_dll_ranges.push((base, base + size, mod_name.clone(), mod_path));
+                loaded_dll_ranges.push((base, base + size, mod_name.clone(), mod_path.clone()));
 
                 if mod_name.eq_ignore_ascii_case("opengl32.dll") {
                     opengl_base = Some(base);
+                }
+                if mod_name.eq_ignore_ascii_case("glfw3.dll") || mod_name.eq_ignore_ascii_case("glfw.dll") {
+                    glfw_info = Some((base, mod_path));
                 }
 
                 if Module32NextW(snapshot, &mut entry) == 0 {
@@ -1123,6 +1415,85 @@ fn check_graphics_pipeline_hooks(handle: HANDLE, pid: u32, report: &mut ScanRepo
                         .with_evidence("Target Destination", target_module_name)
                         .with_evidence("Hook Address", format!("0x{:X}", remote_swap_addr)),
                     );
+                }
+            }
+        }
+
+        // Modern Minecraft (1.13+ LWJGL 3 / GLFW): inspect glfwSwapBuffers hook
+        // Safe memory-based export resolution directly from remote process (no LoadLibrary / 0xc0000428 error)
+        if let Some((remote_glfw_base, _)) = glfw_info {
+            if let Some(remote_swap_addr) = get_remote_proc_address(handle, remote_glfw_base, "glfwSwapBuffers") {
+                let mut bytes = [0u8; 16];
+                let mut bytes_read = 0usize;
+
+                if ReadProcessMemory(
+                    handle,
+                    remote_swap_addr as *const c_void,
+                    bytes.as_mut_ptr() as *mut c_void,
+                    bytes.len(),
+                    &mut bytes_read,
+                ) != 0 && bytes_read >= 5 {
+                    let b0 = bytes[0];
+                    let is_hooked = b0 == 0xE9
+                        || b0 == 0xEB
+                        || (bytes[0] == 0xFF && bytes[1] == 0x25)
+                        || (bytes[0] == 0x48 && bytes[1] == 0xB8 && bytes[10] == 0xFF && bytes[11] == 0xE0);
+
+                    if is_hooked {
+                        let target_addr: Option<usize> = if b0 == 0xE9 {
+                            let rel32 = i32::from_le_bytes(bytes[1..5].try_into().unwrap_or([0; 4]));
+                            Some((remote_swap_addr + 5).wrapping_add(rel32 as usize))
+                        } else if bytes[0] == 0x48 && bytes[1] == 0xB8 {
+                            Some(u64::from_le_bytes(bytes[2..10].try_into().unwrap_or([0; 8])) as usize)
+                        } else {
+                            None
+                        };
+
+                        let mut is_whitelisted_overlay = false;
+                        let mut target_module_name = "Unbacked Executable Memory (Ghost Client Payload)".to_string();
+
+                        if let Some(target) = target_addr {
+                            for (start, end, name, path) in &loaded_dll_ranges {
+                                if target >= *start && target < *end {
+                                    target_module_name = name.clone();
+                                    let lower = name.to_lowercase();
+                                    let lower_path = path.to_lowercase();
+                                    if lower.contains("discordhook")
+                                        || lower.contains("graphics-hook")
+                                        || lower.contains("rtss")
+                                        || lower.contains("gameoverlayrenderer")
+                                        || lower.contains("nvspcap")
+                                    {
+                                        let path_obj = Path::new(path);
+                                        let is_signed = path_obj.is_file() && crate::scanner::forensics::is_pe_signed(path_obj);
+                                        let in_volatile = crate::scanner::forensics::is_volatile_directory(&lower_path);
+                                        if is_signed && !in_volatile {
+                                            is_whitelisted_overlay = true;
+                                        }
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+
+                        if !is_whitelisted_overlay {
+                            report.add(
+                                ScanFinding::new(
+                                    "Hooked GLFW Graphics Pipeline (glfwSwapBuffers Detour)",
+                                    FindingCategory::MemoryInspection,
+                                    VerdictLevel::Detection,
+                                    format!(
+                                        "Detected inline JMP detour hook on glfw3!glfwSwapBuffers pointing to: {}. Used by modern Minecraft ghost clients for ESP/ClickGUI rendering.",
+                                        target_module_name
+                                    ),
+                                )
+                                .with_evidence("Function", "glfw3.dll!glfwSwapBuffers".to_string())
+                                .with_evidence("Hook Bytes", format!("{:02X?}", &bytes[..bytes_read]))
+                                .with_evidence("Target Destination", target_module_name)
+                                .with_evidence("Hook Address", format!("0x{:X}", remote_swap_addr)),
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1765,15 +2136,25 @@ const CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4 MB chunks
             mbi_size,
         ) != 0
         {
-        // Scan private pages only (MEM_PRIVATE: Java Heap, Stack, Manual Map, Metaspace)
-        // Skip MEM_IMAGE (original on-disk DLLs) and MEM_MAPPED (mapped files), accelerating scanning ~8x!
-            if mbi.State == MEM_COMMIT
-                && mbi.Type == MEM_PRIVATE
-                && (mbi.Protect == PAGE_READWRITE
-                    || mbi.Protect == PAGE_READONLY
-                    || mbi.Protect == PAGE_EXECUTE_READWRITE
-                    || mbi.Protect == PAGE_EXECUTE_READ)
-            {
+        // Scan private pages (MEM_PRIVATE) and suspicious mapped sections (MEM_MAPPED)
+            let is_candidate_page = if mbi.State == MEM_COMMIT {
+                if mbi.Type == MEM_PRIVATE {
+                    mbi.Protect == PAGE_READWRITE
+                        || mbi.Protect == PAGE_READONLY
+                        || mbi.Protect == PAGE_EXECUTE_READWRITE
+                        || mbi.Protect == PAGE_EXECUTE_READ
+                } else if mbi.Type == MEM_MAPPED {
+                    mbi.Protect == PAGE_EXECUTE_READ
+                        || mbi.Protect == PAGE_EXECUTE_READWRITE
+                        || mbi.Protect == PAGE_READWRITE
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if is_candidate_page {
                 let is_executable = mbi.Protect == PAGE_EXECUTE_READ || mbi.Protect == PAGE_EXECUTE_READWRITE;
                 let mut region_offset = 0usize;
 
@@ -1819,23 +2200,27 @@ const CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4 MB chunks
                                 }
                             }
 
-                // False-positive filter: mod blacklists in launchers and anticheats (e.g. Feather / Dawn Client blocked-mods list)
-                // NEVER filter custom user rules!
+                // False-positive filter: only suppress if within a verified launcher anticheat constant pool (e.g. Feather / Dawn)
+                // and NEVER suppress actual cheat class names, hooks, commands, or feature configs!
                             if rule.source.is_none() {
-                                let check_start = mat.start().saturating_sub(384);
-                                let check_end = (mat.end() + 384).min(slice.len());
-                                let surrounding = String::from_utf8_lossy(&slice[check_start..check_end]).to_lowercase();
-                                let is_launcher_anticheat_blacklist = (surrounding.contains("blacklist") && (surrounding.contains("blocked_mod") || surrounding.contains("blockedmod") || surrounding.contains("banned_mod") || surrounding.contains(".jar") || surrounding.contains("mod_id")))
-                                    || surrounding.contains("blocked_mod")
-                                    || surrounding.contains("blockedmod")
-                                    || surrounding.contains("banned_mod")
-                                    || (surrounding.contains("prohibited") && surrounding.contains("mod"))
-                                    || (surrounding.contains("forbidden") && surrounding.contains("mod"))
-                                    || (surrounding.contains("hitboxexpander.class") && surrounding.contains("wurstclient.class"))
-                                    || (surrounding.contains("liquidbounce") && surrounding.contains("doomsday"));
+                                let is_pure_jar_or_mod_name = rule.pattern.ends_with(".jar") || !rule.pattern.contains(".class");
+                                if is_pure_jar_or_mod_name {
+                                    let check_start = mat.start().saturating_sub(256);
+                                    let check_end = (mat.end() + 256).min(slice.len());
+                                    let surrounding = String::from_utf8_lossy(&slice[check_start..check_end]).to_lowercase();
 
-                                if is_launcher_anticheat_blacklist {
-                                    continue;
+                                    let in_launcher_ac = surrounding.contains("net/digitalingot/")
+                                        || surrounding.contains("digital/feather/")
+                                        || surrounding.contains("com/dawn/");
+
+                                    let is_blacklist_table = surrounding.contains("blocked_mod")
+                                        || surrounding.contains("blockedmod")
+                                        || surrounding.contains("banned_mod")
+                                        || surrounding.contains("prohibited");
+
+                                    if in_launcher_ac && is_blacklist_table {
+                                        continue;
+                                    }
                                 }
                             }
 
@@ -2439,11 +2824,12 @@ fn check_open_handles_to_minecraft(mc_pid: u32, report: &mut ScanReport) {
                 continue;
             }
 
-        // Check exclusively for process memory write permissions (PROCESS_VM_WRITE = 0x0020)
-        // or memory operations (PROCESS_VM_OPERATION = 0x0008) or full access (PROCESS_ALL_ACCESS)
+        // Check for process memory write permissions (PROCESS_VM_WRITE = 0x0020),
+        // memory operations (PROCESS_VM_OPERATION = 0x0008), full access, OR memory read (PROCESS_VM_READ = 0x0010)
             let access = entry.granted_access;
             let has_write_access = (access & 0x0020 != 0) || (access & 0x0008 != 0) || (access == 0x001F0FFF) || (access == 0x1FFFFF);
-            if !has_write_access {
+            let has_read_access = access & 0x0010 != 0;
+            if !has_write_access && !has_read_access {
                 continue;
             }
 
@@ -2541,34 +2927,64 @@ fn check_open_handles_to_minecraft(mc_pid: u32, report: &mut ScanReport) {
                     let is_whitelisted = is_system_proc || ((is_known_tool_name || is_parent_launcher) && !in_volatile_dir && is_signed);
 
                     if !is_whitelisted {
-                        let access_desc = format!(
-                            "0x{:08X} (VM_WRITE: {}, VM_OPERATION: {})",
-                            access,
-                            if access & 0x0020 != 0 { "TAK" } else { "NIE" },
-                            if access & 0x0008 != 0 { "TAK" } else { "NIE" }
-                        );
+                        if has_write_access {
+                            let access_desc = format!(
+                                "0x{:08X} (VM_WRITE: {}, VM_OPERATION: {})",
+                                access,
+                                if access & 0x0020 != 0 { "TAK" } else { "NIE" },
+                                if access & 0x0008 != 0 { "TAK" } else { "NIE" }
+                            );
 
-                        let mut finding = ScanFinding::new(
-                            "External Process Holds Memory Write Handle to Minecraft",
-                            FindingCategory::MinecraftRuntime,
-                            VerdictLevel::Detection,
-                            format!(
-                                "External process '{}' (PID: {}) holds an active write/tamper handle to Minecraft (PID: {}). Access mask: {}. This indicates external memory manipulation, aimbot, reach, or ghost cheat injection.",
-                                owner_name, owner_pid, mc_pid, access_desc
-                            ),
-                        )
-                        .with_evidence("Owner Process", owner_name)
-                        .with_evidence("Owner PID", owner_pid.to_string())
-                        .with_evidence("Granted Access", access_desc)
-                        .with_evidence("Minecraft PID", mc_pid.to_string())
-                        .with_evidence("Process Path", if owner_path.is_empty() { "Niedostępna".to_string() } else { owner_path })
-                        .with_evidence("Podpis cyfrowy Authenticode", if is_signed { "TAK (Prawidłowy podpis)".to_string() } else { "NIE (Brak ważnego certyfikatu wydawcy)".to_string() });
+                            let mut finding = ScanFinding::new(
+                                "External Process Holds Memory Write Handle to Minecraft",
+                                FindingCategory::MinecraftRuntime,
+                                VerdictLevel::Detection,
+                                format!(
+                                    "External process '{}' (PID: {}) holds an active write/tamper handle to Minecraft (PID: {}). Access mask: {}. This indicates external memory manipulation, aimbot, reach, or ghost cheat injection.",
+                                    owner_name, owner_pid, mc_pid, access_desc
+                                ),
+                            )
+                            .with_evidence("Owner Process", owner_name)
+                            .with_evidence("Owner PID", owner_pid.to_string())
+                            .with_evidence("Granted Access", access_desc)
+                            .with_evidence("Minecraft PID", mc_pid.to_string())
+                            .with_evidence("Process Path", if owner_path.is_empty() { "Niedostępna".to_string() } else { owner_path })
+                            .with_evidence("Podpis cyfrowy Authenticode", if is_signed { "TAK (Prawidłowy podpis)".to_string() } else { "NIE (Brak ważnego certyfikatu wydawcy)".to_string() });
 
-                        if in_volatile_dir {
-                            finding = finding.with_evidence("Lokalizacja pliku", "Katalog ulotny (Pulpit/Pobrane/Temp) - wysokie podejrzenie podszywania się (Masquerading)".to_string());
+                            if in_volatile_dir {
+                                finding = finding.with_evidence("Lokalizacja pliku", "Katalog ulotny (Pulpit/Pobrane/Temp) - wysokie podejrzenie podszywania się (Masquerading)".to_string());
+                            }
+
+                            report.add(finding);
+                        } else if has_read_access {
+                            let level = if in_volatile_dir || !is_signed {
+                                VerdictLevel::Warning
+                            } else {
+                                VerdictLevel::Information
+                            };
+
+                            let mut finding = ScanFinding::new(
+                                "External Process Holds Memory Read Handle to Minecraft",
+                                FindingCategory::MinecraftRuntime,
+                                level,
+                                format!(
+                                    "External process '{}' (PID: {}) holds an active read handle (PROCESS_VM_READ: 0x{:08X}) to Minecraft (PID: {}). Typical for external radars, ESP overlays, or memory readers.",
+                                    owner_name, owner_pid, access, mc_pid
+                                ),
+                            )
+                            .with_evidence("Owner Process", owner_name)
+                            .with_evidence("Owner PID", owner_pid.to_string())
+                            .with_evidence("Granted Access", format!("0x{:08X} (PROCESS_VM_READ)", access))
+                            .with_evidence("Minecraft PID", mc_pid.to_string())
+                            .with_evidence("Process Path", if owner_path.is_empty() { "Niedostępna".to_string() } else { owner_path })
+                            .with_evidence("Podpis cyfrowy Authenticode", if is_signed { "TAK (Prawidłowy podpis)".to_string() } else { "NIE (Brak ważnego certyfikatu wydawcy)".to_string() });
+
+                            if in_volatile_dir {
+                                finding = finding.with_evidence("Lokalizacja pliku", "Katalog ulotny (Pulpit/Pobrane/Temp) - wysokie podejrzenie zewnętrznego cheata".to_string());
+                            }
+
+                            report.add(finding);
                         }
-
-                        report.add(finding);
                     }
                 }
             }
@@ -2929,4 +3345,101 @@ mod tests {
             assert!(!uptime.is_empty());
         }
     }
+
+    #[test]
+    fn test_anticheat_blacklist_anti_evasion() {
+        // A cheat author includes "blocked_mod" or "banned_mod" right next to an injected cheat class
+        let fake_cheat_chunk = b"SomeCode... blocked_mod ... AutoWTap.class ... banned_mod ... MoreCode";
+
+        // Verify that AutoWTap.class is NEVER silenced by the false-positive blacklist filter
+        let patterns = get_builtin_cheat_patterns();
+        let autowtap_rule = patterns.iter().find(|r| r.pattern == "AutoWTap.class").expect("AutoWTap rule must exist");
+
+        // The rule pattern contains ".class", so is_pure_jar_or_mod_name is false
+        let is_pure_jar_or_mod_name = autowtap_rule.pattern.ends_with(".jar") || !autowtap_rule.pattern.contains(".class");
+        assert!(!is_pure_jar_or_mod_name, "Compiled cheat classes (.class) must NEVER be eligible for blacklist suppression!");
+
+        // Even for a pure mod name, it must be inside verified launcher packages (net/digitalingot/, com/dawn/)
+        let surrounding = String::from_utf8_lossy(fake_cheat_chunk).to_lowercase();
+        let in_launcher_ac = surrounding.contains("net/digitalingot/")
+            || surrounding.contains("digital/feather/")
+            || surrounding.contains("com/dawn/");
+        assert!(!in_launcher_ac, "Arbitrary cheat code without launcher anticheat package must not qualify for suppression");
+    }
+
+    #[test]
+    fn test_wiped_pe_detection_logic() {
+        // 1. Legitimate PE header with MZ
+        let mut normal_pe = vec![0u8; 1024];
+        normal_pe[0] = 0x4D;
+        normal_pe[1] = 0x5A;
+        normal_pe[0x3C] = 0x80; // e_lfanew
+        normal_pe[0x80..0x84].copy_from_slice(b"PE\0\0");
+        let has_mz = normal_pe[0] == 0x4D && normal_pe[1] == 0x5A;
+        assert!(has_mz);
+
+        // 2. Wiped DOS header (MZ zeroed out by Reflective DLL / Manual Map)
+        let mut wiped_pe = vec![0u8; 1024];
+        wiped_pe[0] = 0x00;
+        wiped_pe[1] = 0x00;
+        wiped_pe[0x3C] = 0x80; // e_lfanew points to PE signature
+        wiped_pe[0x80..0x84].copy_from_slice(b"PE\0\0");
+
+        let e_lfanew = u32::from_le_bytes(wiped_pe[0x3C..0x40].try_into().unwrap()) as usize;
+        let mut has_wiped_pe = false;
+        if e_lfanew > 0 && e_lfanew + 4 <= wiped_pe.len() {
+            if &wiped_pe[e_lfanew..e_lfanew + 4] == b"PE\0\0" {
+                has_wiped_pe = true;
+            }
+        }
+        assert!(has_wiped_pe, "Manual mapped PE with zeroed MZ header must be detected via e_lfanew PE signature!");
+
+        // 3. Wiped PE header with only section names (.text, .rdata) remaining
+        let mut section_pe = vec![0u8; 1024];
+        section_pe[0x200..0x208].copy_from_slice(b".text\0\0\0");
+        let mut has_section = false;
+        for window in section_pe.windows(8) {
+            if window == b".text\0\0\0" || window == b".rdata\0\0" || window == b".data\0\0\0" {
+                has_section = true;
+                break;
+            }
+        }
+        assert!(has_section, "Manual mapped PE with wiped headers must be detected via PE section remnants!");
+    }
+
+    #[test]
+    fn test_handle_access_read_and_write_distinction() {
+        let write_access: u32 = 0x0020; // PROCESS_VM_WRITE
+        let read_access: u32 = 0x0010;  // PROCESS_VM_READ
+        let query_access: u32 = 0x0400; // PROCESS_QUERY_INFORMATION
+
+        let has_write_1 = (write_access & 0x0020 != 0) || (write_access & 0x0008 != 0);
+        let has_read_1 = write_access & 0x0010 != 0;
+        assert!(has_write_1);
+        assert!(!has_read_1);
+
+        let has_write_2 = (read_access & 0x0020 != 0) || (read_access & 0x0008 != 0);
+        let has_read_2 = read_access & 0x0010 != 0;
+        assert!(!has_write_2);
+        assert!(has_read_2, "PROCESS_VM_READ must be recognized for external radar/ESP detection");
+
+        let has_write_3 = (query_access & 0x0020 != 0) || (query_access & 0x0008 != 0);
+        let has_read_3 = query_access & 0x0010 != 0;
+        assert!(!has_write_3);
+        assert!(!has_read_3);
+    }
+
+
+    #[test]
+    fn test_get_remote_proc_address_resolution() {
+        unsafe {
+            let ntdll = GetModuleHandleA(b"ntdll.dll\0".as_ptr());
+            assert!(!ntdll.is_null());
+            let expected = GetProcAddress(ntdll, b"NtClose\0".as_ptr()).unwrap() as usize;
+            let resolved = get_remote_proc_address(GetCurrentProcess(), ntdll as usize, "NtClose");
+            assert!(resolved.is_some(), "get_remote_proc_address must find NtClose in ntdll");
+            assert_eq!(expected, resolved.unwrap(), "Resolved address must exactly match GetProcAddress");
+        }
+    }
+
 }

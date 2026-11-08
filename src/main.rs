@@ -12,6 +12,15 @@ use std::env;
 use std::io::{self, BufRead};
 
 fn main() -> eframe::Result<()> {
+    // Suppress system modal error dialogs (SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX)
+    // Ensures Windows never halts execution with "Bad Image / 0xc0000428" popups
+    unsafe {
+        windows_sys::Win32::System::Diagnostics::Debug::SetErrorMode(
+            windows_sys::Win32::System::Diagnostics::Debug::SEM_FAILCRITICALERRORS
+                | windows_sys::Win32::System::Diagnostics::Debug::SEM_NOGPFAULTERRORBOX,
+        );
+    }
+
     // Apply process mitigation policies and anti-tamper protections (Anti-Bypass Hardening)
     security::hardening::apply_all_hardening();
 

@@ -8,6 +8,7 @@ pub fn scan_virtual_and_network_drives(report: &mut ScanReport) {
     scan_map_network_drive_mru(report);
     scan_vhdmp_events(report);
     scan_ramdisk_and_virtual_drivers(report);
+    scan_non_journaled_and_ram_volumes(report);
 }
 
 /// 1. Scans network drive mapping history in Map Network Drive MRU
@@ -396,6 +397,83 @@ fn scan_ramdisk_and_virtual_drivers(report: &mut ScanReport) {
         }
         if !kernel32.is_null() {
             windows_sys::Win32::Foundation::FreeLibrary(kernel32);
+        }
+    }
+}
+
+/// 4. Scans all mounted volumes to identify non-journaled file systems (FAT, FAT32, exFAT, RAW)
+/// and RAM disks where NTFS USN change journaling is unavailable.
+pub fn scan_non_journaled_and_ram_volumes(report: &mut ScanReport) {
+    unsafe {
+        let mut buf = [0u16; 512];
+        let len = windows_sys::Win32::Storage::FileSystem::GetLogicalDriveStringsW(buf.len() as u32, buf.as_mut_ptr());
+        if len == 0 || len >= buf.len() as u32 {
+            return;
+        }
+
+        let mut idx = 0usize;
+        while idx < len as usize {
+            let start = idx;
+            while idx < len as usize && buf[idx] != 0 {
+                idx += 1;
+            }
+            if idx > start {
+                let root_slice = &buf[start..idx];
+                let drive_str = String::from_utf16_lossy(root_slice);
+
+                let root_with_null: Vec<u16> = root_slice.iter().copied().chain(std::iter::once(0)).collect();
+                let drive_type = windows_sys::Win32::Storage::FileSystem::GetDriveTypeW(root_with_null.as_ptr());
+
+                let mut vol_name = [0u16; 260];
+                let mut fs_name = [0u16; 260];
+                let mut serial = 0u32;
+                let mut max_comp_len = 0u32;
+                let mut flags = 0u32;
+
+                if windows_sys::Win32::Storage::FileSystem::GetVolumeInformationW(
+                    root_with_null.as_ptr(),
+                    vol_name.as_mut_ptr(),
+                    vol_name.len() as u32,
+                    &mut serial,
+                    &mut max_comp_len,
+                    &mut flags,
+                    fs_name.as_mut_ptr(),
+                    fs_name.len() as u32,
+                ) != 0 {
+                    let fs_len = fs_name.iter().position(|&c| c == 0).unwrap_or(fs_name.len());
+                    let fs_str = String::from_utf16_lossy(&fs_name[..fs_len]).to_uppercase();
+
+                    let is_ramdisk = drive_type == 6; // DRIVE_RAMDISK
+                    let is_non_journaled = fs_str.contains("FAT") || fs_str == "EXFAT" || fs_str == "RAW";
+
+                    if is_ramdisk || is_non_journaled {
+                        let drive_type_desc = match drive_type {
+                            2 => "Removable Drive (USB Flash Drive)",
+                            3 => "Fixed Local Disk",
+                            4 => "Remote Network Drive",
+                            6 => "RAM Disk (Volatile Memory)",
+                            _ => "Storage Volume",
+                        };
+
+                        report.add(
+                            ScanFinding::new(
+                                format!("Non-Journaled File System Detected: {}", drive_str),
+                                FindingCategory::WindowsForensics,
+                                VerdictLevel::Warning,
+                                format!(
+                                    "Drive {} uses {} file system ({}). This file system does not support NTFS USN change journaling - deleted or renamed cheat files cannot be tracked on this volume. Manual screenshare verification required.",
+                                    drive_str, fs_str, drive_type_desc
+                                ),
+                            )
+                            .with_evidence("Drive", drive_str)
+                            .with_evidence("File System", fs_str)
+                            .with_evidence("Drive Type", drive_type_desc.to_string())
+                            .with_evidence("USN Journal Supported", "NO (Non-NTFS volume)".to_string()),
+                        );
+                    }
+                }
+            }
+            idx += 1;
         }
     }
 }

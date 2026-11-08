@@ -128,6 +128,58 @@ pub fn scan_prefetch(report: &mut ScanReport) {
                     }
                 }
 
+            // Detect unknown/renamed executables in current session that touched Minecraft internals (.minecraft / jvm.dll / lwjgl)
+            let is_known_mc_or_system = lower.starts_with("javaw.exe-")
+                || lower.starts_with("java.exe-")
+                || lower.starts_with("minecraft.exe-")
+                || lower.starts_with("minecraftlauncher.exe-")
+                || lower.starts_with("prismlauncher.exe-")
+                || lower.starts_with("lunar client.exe-")
+                || lower.starts_with("badlion client.exe-")
+                || lower.starts_with("feather client.exe-")
+                || lower.starts_with("modrinth app.exe-")
+                || lower.starts_with("curseforge.exe-")
+                || lower.starts_with("overwolf.exe-")
+                || lower.starts_with("grind_scanner.exe-")
+                || lower.starts_with("explorer.exe-")
+                || lower.starts_with("searchhost.exe-")
+                || lower.starts_with("searchapp.exe-")
+                || lower.starts_with("msmpeng.exe-")
+                || lower.starts_with("svchost.exe-")
+                || lower.starts_with("runtimebroker.exe-")
+                || lower.starts_with("smartscreen.exe-")
+                || lower.starts_with("shellexperiencehost.exe-");
+
+            if !is_known_mc_or_system {
+                let (modified, in_current_session) = if let Ok(metadata) = entry.metadata() {
+                    if let Ok(mtime) = metadata.modified() {
+                        (super::format_system_time(mtime), super::is_system_time_in_current_session(mtime))
+                    } else {
+                        ("Unknown".to_string(), false)
+                    }
+                } else {
+                    ("Unknown".to_string(), false)
+                };
+
+                if in_current_session && check_prefetch_for_minecraft_internals(&path) {
+                    report.add(
+                        ScanFinding::new(
+                            format!("Renamed Cheat / Injector Accessing Minecraft Internals: {}", file_name),
+                            FindingCategory::WindowsForensics,
+                            VerdictLevel::Detection,
+                            format!(
+                                "Windows Prefetch forensics reveals that non-game executable '{}' (executed in current session) accessed Minecraft core runtime files (.minecraft / jvm.dll / lwjgl). This is a direct indicator of a renamed cheat loader or injector masquerading as a harmless application.",
+                                file_name
+                            ),
+                        )
+                        .with_evidence("Prefetch File", file_name.to_string())
+                        .with_evidence("Session Scope", "Current Session (Executed after PC Boot)".to_string())
+                        .with_evidence("Accessed Targets", ".minecraft / jvm.dll / lwjgl runtime libraries".to_string())
+                        .with_evidence("Execution Timestamp", modified),
+                    );
+                }
+            }
+
         // Skip trusted processes and anticheat installers (e.g. EasyAntiCheat, BattlEye)
                 if super::is_whitelisted_executable(&lower) {
                     continue;
@@ -325,6 +377,52 @@ fn decompress_mam_prefetch(data: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+
+fn check_prefetch_for_minecraft_internals(path: &Path) -> bool {
+    let data = match fs::read(path) {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+
+    if data.starts_with(b"MAM\x04") {
+        if let Some(decompressed) = decompress_mam_prefetch(&data) {
+            return contains_minecraft_internals_needle(&decompressed);
+        }
+    }
+    contains_minecraft_internals_needle(&data)
+}
+
+fn contains_minecraft_internals_needle(data: &[u8]) -> bool {
+    let lower_data: Vec<u8> = data.iter().map(|b| b.to_ascii_lowercase()).collect();
+
+    let ascii_mc = br"\.minecraft\";
+    let ascii_jvm = br"\jvm.dll";
+    let ascii_lwjgl = br"\lwjgl";
+
+    // ASCII needles
+    if lower_data.windows(ascii_mc.len()).any(|w| w == ascii_mc)
+        || lower_data.windows(ascii_jvm.len()).any(|w| w == ascii_jvm)
+        || lower_data.windows(ascii_lwjgl.len()).any(|w| w == ascii_lwjgl)
+    {
+        return true;
+    }
+
+    // UTF-16 needles
+    let dot_mc_utf16: [u8; 24] = [
+        b'\\', 0, b'.', 0, b'm', 0, b'i', 0, b'n', 0, b'e', 0, b'c', 0, b'r', 0, b'a', 0, b'f', 0, b't', 0, b'\\', 0,
+    ];
+    let jvm_utf16: [u8; 16] = [
+        b'\\', 0, b'j', 0, b'v', 0, b'm', 0, b'.', 0, b'd', 0, b'l', 0, b'l', 0,
+    ];
+    let lwjgl_utf16: [u8; 12] = [
+        b'\\', 0, b'l', 0, b'w', 0, b'j', 0, b'g', 0, b'l', 0,
+    ];
+
+    lower_data.windows(dot_mc_utf16.len()).any(|w| w == dot_mc_utf16)
+        || lower_data.windows(jvm_utf16.len()).any(|w| w == jvm_utf16)
+        || lower_data.windows(lwjgl_utf16.len()).any(|w| w == lwjgl_utf16)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,4 +442,21 @@ mod tests {
         let clean_data = b"\\Device\\HarddiskVolume3\\Windows\\System32\\cmd.exe";
         assert!(!contains_winsock_needle(clean_data));
     }
+
+    #[test]
+    fn test_contains_minecraft_internals_needle() {
+        let ascii_sample = b"Loaded files: C:\\Program Files\\SomeApp\\app.exe and C:\\Users\\User\\AppData\\Roaming\\.minecraft\\mods";
+        assert!(contains_minecraft_internals_needle(ascii_sample));
+
+        let mut utf16_sample = Vec::new();
+        for &b in br"\Device\HarddiskVolume3\Program Files\Java\bin\server\jvm.dll" {
+            utf16_sample.push(b);
+            utf16_sample.push(0);
+        }
+        assert!(contains_minecraft_internals_needle(&utf16_sample));
+
+        let clean_sample = br"\Device\HarddiskVolume3\Windows\System32\notepad.exe";
+        assert!(!contains_minecraft_internals_needle(clean_sample));
+    }
+
 }
