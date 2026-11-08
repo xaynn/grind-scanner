@@ -19,6 +19,11 @@ fn main() -> eframe::Result<()> {
             windows_sys::Win32::System::Diagnostics::Debug::SEM_FAILCRITICALERRORS
                 | windows_sys::Win32::System::Diagnostics::Debug::SEM_NOGPFAULTERRORBOX,
         );
+        windows_sys::Win32::System::Diagnostics::Debug::SetThreadErrorMode(
+            windows_sys::Win32::System::Diagnostics::Debug::SEM_FAILCRITICALERRORS
+                | windows_sys::Win32::System::Diagnostics::Debug::SEM_NOGPFAULTERRORBOX,
+            std::ptr::null_mut(),
+        );
     }
 
     // Apply process mitigation policies and anti-tamper protections (Anti-Bypass Hardening)

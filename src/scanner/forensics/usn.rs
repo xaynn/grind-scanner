@@ -368,6 +368,13 @@ fn evaluate_deleted_file(name: &str, in_current_session: bool) -> Option<(Verdic
                 "Cheat Executable/DLL Deleted in Current Session (USN Journal Trace)",
                 matched_trigger,
             ));
+        } else {
+            // Flag any binary executable or DLL deleted during current session to catch neutral-named loaders (e.g. AudioServiceHelper.exe)
+            return Some((
+                VerdictLevel::Warning,
+                "Binary Executable/DLL Deleted in Current Session (Anti-Forensics / Trace Wiping)",
+                None,
+            ));
         }
     }
 
@@ -473,4 +480,18 @@ mod tests {
     fn test_evaluate_deleted_evtx_past_session_ignored() {
         assert!(evaluate_deleted_file("System.evtx", false).is_none());
     }
+
+    #[test]
+    fn test_evaluate_deleted_neutral_binary_current_session() {
+        let res = evaluate_deleted_file("AudioServiceHelper.exe", true);
+        assert!(res.is_some(), "Neutral named binary deleted in current session must be flagged");
+        let (verdict, title, trig) = res.unwrap();
+        assert_eq!(verdict, VerdictLevel::Warning);
+        assert_eq!(title, "Binary Executable/DLL Deleted in Current Session (Anti-Forensics / Trace Wiping)");
+        assert_eq!(trig, None);
+
+        // Verify that past session neutral binary is ignored
+        assert!(evaluate_deleted_file("AudioServiceHelper.exe", false).is_none());
+    }
+
 }

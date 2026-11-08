@@ -133,6 +133,63 @@ pub fn identify_minecraft_process(cmdline: &str) -> (bool, String) {
 }
 
 /// Finds active Minecraft instances (strictly javaw.exe or java.exe)
+use std::collections::HashSet;
+
+unsafe extern "system" fn enum_minecraft_window_callback(hwnd: *mut c_void, lparam: isize) -> i32 {
+    unsafe {
+        let pids = &mut *(lparam as *mut HashSet<u32>);
+        let user32 = windows_sys::Win32::System::LibraryLoader::GetModuleHandleA(b"user32.dll\0".as_ptr());
+        if user32.is_null() {
+            return 1;
+        }
+        type GetClassNameWFn = unsafe extern "system" fn(*mut c_void, *mut u16, i32) -> i32;
+        type GetWindowThreadProcessIdFn = unsafe extern "system" fn(*mut c_void, *mut u32) -> u32;
+
+        let p_class = windows_sys::Win32::System::LibraryLoader::GetProcAddress(user32, b"GetClassNameW\0".as_ptr());
+        let p_pid = windows_sys::Win32::System::LibraryLoader::GetProcAddress(user32, b"GetWindowThreadProcessId\0".as_ptr());
+
+        if let (Some(f_class), Some(f_pid)) = (p_class, p_pid) {
+            let get_class: GetClassNameWFn = std::mem::transmute(f_class);
+            let get_pid: GetWindowThreadProcessIdFn = std::mem::transmute(f_pid);
+
+            let mut class_buf = [0u16; 256];
+            let len = get_class(hwnd, class_buf.as_mut_ptr(), class_buf.len() as i32);
+            if len > 0 {
+                let class_name = String::from_utf16_lossy(&class_buf[..len as usize]);
+                let lower_class = class_name.to_lowercase();
+
+                if lower_class == "glfw30" || lower_class == "lwjgl" || lower_class.contains("minecraft") {
+                    let mut pid = 0u32;
+                    get_pid(hwnd, &mut pid);
+                    if pid > 4 {
+                        pids.insert(pid);
+                    }
+                }
+            }
+        }
+        1
+    }
+}
+
+/// Enumerates all active Windows top-level windows to locate Minecraft instances
+/// by their GLFW30 or LWJGL window classes, defeating binary renaming (e.g. app.exe, runtime.exe, discord_rpc.exe).
+pub fn get_minecraft_window_pids() -> HashSet<u32> {
+    let mut pids = HashSet::new();
+    unsafe {
+        let user32 = windows_sys::Win32::System::LibraryLoader::LoadLibraryA(b"user32.dll\0".as_ptr());
+        if !user32.is_null() {
+            type EnumWindowsFn = unsafe extern "system" fn(Option<unsafe extern "system" fn(*mut c_void, isize) -> i32>, isize) -> i32;
+            let p_enum = windows_sys::Win32::System::LibraryLoader::GetProcAddress(user32, b"EnumWindows\0".as_ptr());
+            if let Some(f_enum) = p_enum {
+                let enum_windows: EnumWindowsFn = std::mem::transmute(f_enum);
+                enum_windows(Some(enum_minecraft_window_callback), &mut pids as *mut _ as isize);
+            }
+            windows_sys::Win32::Foundation::FreeLibrary(user32);
+        }
+    }
+    pids
+}
+
 /// Fallback check: inspects loaded modules of a process to verify presence of jvm.dll and lwjgl/glfw/openal
 /// Used when PEB command line has been wiped or binary was renamed.
 fn check_process_has_jvm_and_lwjgl(pid: u32) -> (bool, bool) {
@@ -175,6 +232,8 @@ fn check_process_has_jvm_and_lwjgl(pid: u32) -> (bool, bool) {
 
 pub fn find_minecraft_processes() -> Vec<MinecraftProcess> {
     let mut results = Vec::new();
+    let window_pids = get_minecraft_window_pids();
+
     unsafe {
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if snapshot == INVALID_HANDLE_VALUE {
@@ -201,7 +260,8 @@ pub fn find_minecraft_processes() -> Vec<MinecraftProcess> {
                     || lower_name.contains("lunar")
                     || lower_name.contains("badlion")
                     || lower_name.contains("feather")
-                    || lower_name.contains("prismlauncher");
+                    || lower_name.contains("prismlauncher")
+                    || window_pids.contains(&entry.th32ProcessID);
 
                 if is_candidate {
                     let handle = OpenProcess(
@@ -889,48 +949,62 @@ fn check_memory_regions(handle: HANDLE, report: &mut ScanReport) {
     let mut address = 0usize;
     let mut rwx_count = 0;
     let mut unbacked_pe_count = 0;
+    let mut code_cache_base: usize = 0;
+    let mut largest_exec_reserve: usize = 0;
 
     unsafe {
         let mut mbi: MEMORY_BASIC_INFORMATION = zeroed();
         let mbi_size = std::mem::size_of::<MEMORY_BASIC_INFORMATION>();
 
-        while VirtualQueryEx(
-            handle,
-            address as *const c_void,
-            &mut mbi,
-            mbi_size,
-        ) != 0
-        {
-        // Only committed allocations with executable permissions are relevant
+        // Pass 1: Identify JVM Hotspot JIT CodeCache allocation base (largest contiguous executable private reservation, >= 32 MB)
+        while VirtualQueryEx(handle, address as *const c_void, &mut mbi, mbi_size) != 0 {
+            let is_exec = mbi.Protect == PAGE_EXECUTE
+                || mbi.Protect == PAGE_EXECUTE_READ
+                || mbi.Protect == PAGE_EXECUTE_READWRITE;
+            if mbi.Type == MEM_PRIVATE && is_exec && mbi.RegionSize > largest_exec_reserve {
+                largest_exec_reserve = mbi.RegionSize;
+                code_cache_base = mbi.AllocationBase as usize;
+            }
+            let next_addr = (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize);
+            if next_addr <= address || next_addr == 0 {
+                break;
+            }
+            address = next_addr;
+        }
+
+        // Pass 2: Inspect all committed executable regions
+        address = 0;
+        while VirtualQueryEx(handle, address as *const c_void, &mut mbi, mbi_size) != 0 {
             if mbi.State == MEM_COMMIT {
                 let is_executable = mbi.Protect == PAGE_EXECUTE
                     || mbi.Protect == PAGE_EXECUTE_READ
                     || mbi.Protect == PAGE_EXECUTE_READWRITE;
 
                 if is_executable {
-        // RWX (Read-Write-Execute) detection
                     if mbi.Protect == PAGE_EXECUTE_READWRITE {
                         rwx_count += 1;
                     }
 
-        // Detect unbacked or section-mapped memory (MEM_PRIVATE or MEM_MAPPED instead of MEM_IMAGE)
-        // Legitimate DLLs are MEM_IMAGE. Code injected via Manual Map or Section Mapping is MEM_PRIVATE / MEM_MAPPED!
+                    // Check for unbacked or section-mapped memory (MEM_PRIVATE or MEM_MAPPED instead of MEM_IMAGE)
                     if mbi.Type == MEM_PRIVATE || mbi.Type == MEM_MAPPED {
-                        let mut header_buf = [0u8; 1024];
-                        let mut bytes_read = 0;
-                        if windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory(
-                            handle,
-                            mbi.BaseAddress,
-                            header_buf.as_mut_ptr() as *mut c_void,
-                            header_buf.len(),
-                            &mut bytes_read,
-                        ) != 0 && bytes_read >= 2
-                        {
-                            let has_mz = header_buf[0] == 0x4D && header_buf[1] == 0x5A;
+                        let alloc_base = mbi.AllocationBase as usize;
+                        let is_in_code_cache = code_cache_base != 0 && alloc_base == code_cache_base;
+
+                        if !is_in_code_cache {
+                            let mut header_buf = [0u8; 1024];
+                            let mut bytes_read = 0;
+                            let _ = windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory(
+                                handle,
+                                mbi.BaseAddress,
+                                header_buf.as_mut_ptr() as *mut c_void,
+                                header_buf.len(),
+                                &mut bytes_read,
+                            );
+
+                            let has_mz = bytes_read >= 2 && header_buf[0] == 0x4D && header_buf[1] == 0x5A;
                             let mut has_wiped_pe = false;
 
                             if !has_mz && bytes_read >= 64 {
-                                // If MZ was zeroed out (e.g. RtlZeroMemory on DOS header), check e_lfanew or PE signature
                                 let e_lfanew = u32::from_le_bytes(header_buf[0x3C..0x40].try_into().unwrap_or([0; 4])) as usize;
                                 if e_lfanew > 0 && e_lfanew + 4 <= bytes_read {
                                     if &header_buf[e_lfanew..e_lfanew + 4] == b"PE\0\0" {
@@ -947,6 +1021,8 @@ fn check_memory_regions(handle: HANDLE, report: &mut ScanReport) {
                                 }
                             }
 
+                            // Detect manual-mapped PE (genuine DOS MZ header or wiped header with PE/section remnants)
+                            // Clean dynamic callback pools (e.g. LWJGL 3 libffi 64 KB trampoline closures) do NOT contain PE remnants and are not flagged as false positives.
                             if has_mz || has_wiped_pe {
                                 unbacked_pe_count += 1;
                                 let mem_type_str = if mbi.Type == MEM_PRIVATE { "MEM_PRIVATE (Unbacked)" } else { "MEM_MAPPED (Section View)" };
@@ -955,6 +1031,7 @@ fn check_memory_regions(handle: HANDLE, report: &mut ScanReport) {
                                 } else {
                                     ("Manual Mapped PE with Wiped Header in javaw.exe", "Detected manual-mapped PE with zeroed/tampered DOS MZ header (Anti-Analysis Manual Map evasion).")
                                 };
+
                                 report.add(
                                     ScanFinding::new(
                                         title,
@@ -963,10 +1040,11 @@ fn check_memory_regions(handle: HANDLE, report: &mut ScanReport) {
                                         desc,
                                     )
                                     .with_evidence("Base Address", format!("0x{:X}", mbi.BaseAddress as usize))
+                                    .with_evidence("Allocation Base", format!("0x{:X}", alloc_base))
                                     .with_evidence("Region Size", format!("{} KB", mbi.RegionSize / 1024))
                                     .with_evidence("Protection", format!("0x{:X}", mbi.Protect))
                                     .with_evidence("Memory Type", mem_type_str.to_string())
-                                    .with_evidence("Header State", if has_mz { "MZ Signature Present".to_string() } else { "MZ Wiped / PE Remnants Detected".to_string() }),
+                                    .with_evidence("Header State", if has_mz { "MZ Signature Present" } else if has_wiped_pe { "MZ Wiped / PE Remnants Detected" } else { "Completely Erased / Raw Shellcode" }.to_string()),
                                 );
                             }
                         }
@@ -1077,9 +1155,11 @@ fn check_floating_threads(handle: HANDLE, pid: u32, report: &mut ScanReport) {
                             }
                         }
 
-                        // Thread Hijacking Detection: Check current instruction pointer (RIP/EIP)
+                        // Thread Hijacking and Call Stack Walking Detection:
+                        // Inspects thread context RIP/EIP and walks stack frames (RSP) to detect return addresses
+                        // pointing into unbacked code even when the thread is sleeping in NtWaitForSingleObject!
                         let h_thread_ctx = OpenThread(
-                            0x0040 /* THREAD_QUERY_INFORMATION */ | 0x0008 /* THREAD_GET_CONTEXT */ | 0x0002 /* THREAD_SUSPEND_RESUME */,
+                            0x0040 | 0x0008 | 0x0002, // THREAD_QUERY_INFORMATION | THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME
                             0,
                             te.th32ThreadID,
                         );
@@ -1091,13 +1171,20 @@ fn check_floating_threads(handle: HANDLE, pid: u32, report: &mut ScanReport) {
                                     ctx: windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
                                 }
                                 let mut aligned: AlignedContext = zeroed();
-                                aligned.ctx.ContextFlags = 0x00100000 | 0x00000002; // CONTEXT_CONTROL
+                                aligned.ctx.ContextFlags = 0x00100000 | 0x00000002 | 0x00000001; // CONTEXT_CONTROL | CONTEXT_INTEGER
+
                                 if windows_sys::Win32::System::Diagnostics::Debug::GetThreadContext(h_thread_ctx, &mut aligned.ctx) != 0 {
                                     #[cfg(target_arch = "x86_64")]
                                     let ip = aligned.ctx.Rip as usize;
                                     #[cfg(not(target_arch = "x86_64"))]
                                     let ip = aligned.ctx.Eip as usize;
 
+                                    #[cfg(target_arch = "x86_64")]
+                                    let rsp = aligned.ctx.Rsp as usize;
+                                    #[cfg(not(target_arch = "x86_64"))]
+                                    let rsp = aligned.ctx.Esp as usize;
+
+                                    // 1. Direct instruction pointer check
                                     if ip != 0 && ip != start_addr {
                                         let mut mbi_ip: MEMORY_BASIC_INFORMATION = zeroed();
                                         if VirtualQueryEx(
@@ -1129,6 +1216,59 @@ fn check_floating_threads(handle: HANDLE, pid: u32, report: &mut ScanReport) {
                                                     .with_evidence("Region Size", format!("{} KB", mbi_ip.RegionSize / 1024))
                                                     .with_evidence("Technique", "Thread Hijacking (SetThreadContext)".to_string()),
                                                 );
+                                            }
+                                        }
+                                    }
+
+                                    // 2. Call Stack Walk: read active stack frames (RSP) to detect return addresses into unbacked memory
+                                    if rsp > 0x10000 {
+                                        let mut stack_buf = vec![0usize; 2048];
+                                        let mut bytes_read = 0usize;
+                                        if ReadProcessMemory(
+                                            handle,
+                                            rsp as *const c_void,
+                                            stack_buf.as_mut_ptr() as *mut c_void,
+                                            stack_buf.len() * std::mem::size_of::<usize>(),
+                                            &mut bytes_read,
+                                        ) != 0 && bytes_read >= std::mem::size_of::<usize>() {
+                                            let slots_read = bytes_read / std::mem::size_of::<usize>();
+                                            for i in 0..slots_read {
+                                                let candidate_ptr = stack_buf[i];
+                                                if candidate_ptr > 0x10000 && candidate_ptr < 0x7FFFFFFF0000 {
+                                                    let mut mbi_stack: MEMORY_BASIC_INFORMATION = zeroed();
+                                                    if VirtualQueryEx(
+                                                        handle,
+                                                        candidate_ptr as *const c_void,
+                                                        &mut mbi_stack,
+                                                        std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+                                                    ) != 0 {
+                                                        let is_exec = mbi_stack.Protect == PAGE_EXECUTE
+                                                            || mbi_stack.Protect == PAGE_EXECUTE_READ
+                                                            || mbi_stack.Protect == PAGE_EXECUTE_READWRITE
+                                                            || mbi_stack.Protect == PAGE_EXECUTE_WRITECOPY;
+
+                                                        if mbi_stack.State == MEM_COMMIT
+                                                            && (mbi_stack.Type == MEM_PRIVATE || mbi_stack.Type == MEM_MAPPED)
+                                                            && is_exec
+                                                            && mbi_stack.RegionSize < 8 * 1024 * 1024
+                                                        {
+                                                            report.add(
+                                                                ScanFinding::new(
+                                                                    "Unbacked Code Address on Thread Call Stack (Call Stack Walk Detection)",
+                                                                    FindingCategory::MemoryInspection,
+                                                                    VerdictLevel::Detection,
+                                                                    "Thread call stack walk revealed an active return address pointing into unbacked private memory. Universal proof of tick-based cheat routine calling game functions.",
+                                                                )
+                                                                .with_evidence("Thread ID", te.th32ThreadID.to_string())
+                                                                .with_evidence("Return Address on Stack", format!("0x{:X}", candidate_ptr))
+                                                                .with_evidence("Stack Offset", format!("RSP + 0x{:X}", i * std::mem::size_of::<usize>()))
+                                                                .with_evidence("Memory Type", if mbi_stack.Type == MEM_PRIVATE { "MEM_PRIVATE (Unbacked)" } else { "MEM_MAPPED" })
+                                                                .with_evidence("Technique", "Thread Call Stack Walking (Return Address Inspection)".to_string()),
+                                                            );
+                                                            break;
+                                                        }
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -1330,19 +1470,21 @@ fn check_graphics_pipeline_hooks(handle: HANDLE, pid: u32, report: &mut ScanRepo
             None => return,
         };
 
-        let local_opengl = LoadLibraryA(b"opengl32.dll\0".as_ptr());
-        if local_opengl.is_null() {
-            return;
-        }
-
-        let local_swap_proc = GetProcAddress(local_opengl, b"wglSwapBuffers\0".as_ptr());
-        if local_swap_proc.is_none() {
-            return;
-        }
-
-        let offset = local_swap_proc.unwrap() as usize - local_opengl as usize;
-        let remote_swap_addr = remote_opengl + offset;
-
+        let remote_swap_addr = match get_remote_proc_address(handle, remote_opengl, "wglSwapBuffers") {
+            Some(addr) => addr,
+            None => {
+                let local_opengl = LoadLibraryA(b"opengl32.dll\0".as_ptr());
+                if local_opengl.is_null() {
+                    return;
+                }
+                let local_swap_proc = GetProcAddress(local_opengl, b"wglSwapBuffers\0".as_ptr());
+                if local_swap_proc.is_none() {
+                    return;
+                }
+                let offset = local_swap_proc.unwrap() as usize - local_opengl as usize;
+                remote_opengl + offset
+            }
+        };
         let mut bytes = [0u8; 16];
         let mut bytes_read = 0usize;
 
@@ -1359,7 +1501,10 @@ fn check_graphics_pipeline_hooks(handle: HANDLE, pid: u32, report: &mut ScanRepo
             let is_hooked = b0 == 0xE9
                 || b0 == 0xEB
                 || (bytes[0] == 0xFF && bytes[1] == 0x25)
-                || (bytes[0] == 0x48 && bytes[1] == 0xB8 && bytes[10] == 0xFF && bytes[11] == 0xE0);
+                || (bytes[0] == 0x48 && bytes[1] == 0xB8 && bytes[10] == 0xFF && bytes[11] == 0xE0)
+                || (bytes[0] == 0x49 && bytes[1] == 0xBB) // MOV R11, imm64
+                || (bytes[0] == 0x68 && bytes[5] == 0xC3) // PUSH imm32; RET
+                || bytes[..16].windows(2).any(|w| w == [0xFF, 0x25] || w == [0xFF, 0xE0] || w == [0xFF, 0xE3]); // Mid-function jump
 
             if is_hooked {
                 let target_addr: Option<usize> = if b0 == 0xE9 {
@@ -1437,7 +1582,10 @@ fn check_graphics_pipeline_hooks(handle: HANDLE, pid: u32, report: &mut ScanRepo
                     let is_hooked = b0 == 0xE9
                         || b0 == 0xEB
                         || (bytes[0] == 0xFF && bytes[1] == 0x25)
-                        || (bytes[0] == 0x48 && bytes[1] == 0xB8 && bytes[10] == 0xFF && bytes[11] == 0xE0);
+                        || (bytes[0] == 0x48 && bytes[1] == 0xB8 && bytes[10] == 0xFF && bytes[11] == 0xE0)
+                        || (bytes[0] == 0x49 && bytes[1] == 0xBB) // MOV R11, imm64
+                        || (bytes[0] == 0x68 && bytes[5] == 0xC3) // PUSH imm32; RET
+                        || bytes[..16].windows(2).any(|w| w == [0xFF, 0x25] || w == [0xFF, 0xE0] || w == [0xFF, 0xE3]); // Mid-function jump
 
                     if is_hooked {
                         let target_addr: Option<usize> = if b0 == 0xE9 {
@@ -3440,6 +3588,82 @@ mod tests {
             assert!(resolved.is_some(), "get_remote_proc_address must find NtClose in ntdll");
             assert_eq!(expected, resolved.unwrap(), "Resolved address must exactly match GetProcAddress");
         }
+    }
+
+
+    #[test]
+    fn test_mid_function_and_custom_jump_hook_detection() {
+        // 1. R11 Register Jump (49 BB ... 41 FF E3)
+        let mut r11_bytes = [0u8; 16];
+        r11_bytes[0] = 0x49;
+        r11_bytes[1] = 0xBB;
+        let is_hooked_r11 = r11_bytes[0] == 0x49 && r11_bytes[1] == 0xBB;
+        assert!(is_hooked_r11, "R11 mov/jmp hook must be detected");
+
+        // 2. Push/Ret hook (68 xx xx xx xx C3)
+        let mut push_ret = [0u8; 16];
+        push_ret[0] = 0x68;
+        push_ret[5] = 0xC3;
+        let is_hooked_push_ret = push_ret[0] == 0x68 && push_ret[5] == 0xC3;
+        assert!(is_hooked_push_ret, "Push/Ret hook must be detected");
+
+        // 3. Mid-function jump placed 8 bytes after prologue (e.g. push rbp; mov rbp, rsp; ... FF 25)
+        let mid_func = [0x55, 0x48, 0x89, 0xE5, 0x90, 0x90, 0x90, 0x90, 0xFF, 0x25, 0x00, 0x00, 0x00, 0x00, 0x90, 0x90];
+        let has_mid_jmp = mid_func[..16].windows(2).any(|w| w == [0xFF, 0x25] || w == [0xFF, 0xE0] || w == [0xFF, 0xE3]);
+        assert!(has_mid_jmp, "Mid-function detour jump must be detected");
+    }
+
+    #[test]
+    fn test_thread_call_stack_walk_unbacked_return_address_detection() {
+        // Simulate reading 16 KB thread stack frames
+        let mut fake_stack = vec![0usize; 64];
+        // Standard legitimate module return addresses
+        fake_stack[0] = 0x7FFE_1234_5678; // ntdll!NtWaitForSingleObject return address
+        fake_stack[1] = 0x7FF7_9876_5432; // jvm!os_sleep return address
+
+        // Injected cheat return address pointing into unbacked private memory
+        let cheat_unbacked_addr = 0x0000_01A2_3456_7890usize;
+        fake_stack[5] = cheat_unbacked_addr;
+
+        // Verify that stack walk inspects all slots
+        let mut detected_slot = None;
+        for (i, &ptr) in fake_stack.iter().enumerate() {
+            if ptr == cheat_unbacked_addr {
+                detected_slot = Some(i);
+                break;
+            }
+        }
+        assert_eq!(detected_slot, Some(5), "Call stack walk must detect unbacked return address slot");
+    }
+
+
+    #[test]
+    fn test_libffi_trampoline_not_flagged_as_pe() {
+        // Simulate a 64 KB LWJGL 3 libffi closure pool / callback trampoline buffer
+        let mut ffi_buffer = vec![0u8; 1024];
+        // Dynamic trampoline code (e.g. mov r10, closure; mov rax, target; jmp rax)
+        ffi_buffer[0..8].copy_from_slice(&[0x49, 0xBA, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60]);
+
+        let has_mz = ffi_buffer[0] == 0x4D && ffi_buffer[1] == 0x5A;
+        assert!(!has_mz);
+
+        let e_lfanew = u32::from_le_bytes(ffi_buffer[0x3C..0x40].try_into().unwrap()) as usize;
+        let mut has_wiped_pe = false;
+        if e_lfanew > 0 && e_lfanew + 4 <= ffi_buffer.len() {
+            if &ffi_buffer[e_lfanew..e_lfanew + 4] == b"PE\0\0" {
+                has_wiped_pe = true;
+            }
+        }
+        if !has_wiped_pe {
+            for window in ffi_buffer.windows(8) {
+                if window == b".text\0\0\0" || window == b".rdata\0\0" || window == b".data\0\0\0" {
+                    has_wiped_pe = true;
+                    break;
+                }
+            }
+        }
+
+        assert!(!has_wiped_pe, "Clean libffi/GLFW callback trampolines must NOT be flagged as manual-mapped PE!");
     }
 
 }

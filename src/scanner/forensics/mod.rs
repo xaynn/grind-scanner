@@ -374,9 +374,12 @@ pub fn is_whitelisted_executable(path_or_name: &str) -> bool {
         return false;
     }
 
-    // 4. Official Windows API set system libraries (.dll)
+    // 4. Official Windows API set system libraries (.dll) and legitimate Windows/Office components
     if (lower.starts_with("api-ms-win-") && lower.ends_with(".dll"))
         || (lower.starts_with("ext-ms-win-") && lower.ends_with(".dll"))
+        || lower == "webview2loader.dll"
+        || lower == "loguploader.dll"
+        || lower == "onedrivepatcher.exe"
     {
         return true;
     }
