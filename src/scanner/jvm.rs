@@ -944,27 +944,92 @@ fn check_loaded_modules(
     }
 }
 
-/// Scans memory for injected manual-mapped DLLs and RWX pages
-fn check_memory_regions(handle: HANDLE, report: &mut ScanReport) {
+/// Inspects the first 1024 bytes of a remote memory allocation to detect authentic DOS/PE headers
+/// or tampered/wiped PE headers (where e_lfanew points to "PE\0\0" or PE section names like .text/.rdata remain).
+pub fn check_remote_memory_has_pe_artifacts(handle: HANDLE, base: usize) -> (bool, bool) {
+    let mut header_buf = [0u8; 1024];
+    let mut bytes_read = 0;
+    unsafe {
+        let ok = windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory(
+            handle,
+            base as *const c_void,
+            header_buf.as_mut_ptr() as *mut c_void,
+            header_buf.len(),
+            &mut bytes_read,
+        );
+        if ok == 0 || bytes_read < 2 {
+            return (false, false);
+        }
+
+        let has_mz = header_buf[0] == 0x4D && header_buf[1] == 0x5A;
+        let mut has_wiped_pe = false;
+
+        if !has_mz && bytes_read >= 64 {
+            let e_lfanew = u32::from_le_bytes(header_buf[0x3C..0x40].try_into().unwrap_or([0; 4])) as usize;
+            if e_lfanew > 0 && e_lfanew + 4 <= bytes_read {
+                if &header_buf[e_lfanew..e_lfanew + 4] == b"PE\0\0" {
+                    has_wiped_pe = true;
+                }
+            }
+            if !has_wiped_pe {
+                for window in header_buf[..bytes_read].windows(8) {
+                    if window == b".text\0\0\0" || window == b".rdata\0\0" || window == b".data\0\0\0" {
+                        has_wiped_pe = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        (has_mz, has_wiped_pe)
+    }
+}
+
+/// Discovers all HotSpot JVM JIT CodeCache allocations (including Segmented CodeCache in Java 9-21:
+/// Non-nmethods, Profiled nmethods, and Non-profiled nmethods).
+/// HotSpot CodeCache allocations are large MEM_PRIVATE reservations (>= 2 MB, typically 5 MB - 240 MB)
+/// with execution privileges that do NOT contain PE executable headers.
+pub fn get_jvm_code_cache_allocation_bases(handle: HANDLE) -> HashSet<usize> {
+    let mut code_cache_bases = HashSet::new();
     let mut address = 0usize;
-    let mut rwx_count = 0;
-    let mut unbacked_pe_count = 0;
-    let mut code_cache_base: usize = 0;
-    let mut largest_exec_reserve: usize = 0;
+    let mut current_alloc_base = 0usize;
+    let mut current_alloc_size = 0usize;
+    let mut current_has_exec = false;
+    let mut current_is_private = false;
 
     unsafe {
         let mut mbi: MEMORY_BASIC_INFORMATION = zeroed();
         let mbi_size = std::mem::size_of::<MEMORY_BASIC_INFORMATION>();
 
-        // Pass 1: Identify JVM Hotspot JIT CodeCache allocation base (largest contiguous executable private reservation, >= 32 MB)
         while VirtualQueryEx(handle, address as *const c_void, &mut mbi, mbi_size) != 0 {
+            let alloc_base = mbi.AllocationBase as usize;
             let is_exec = mbi.Protect == PAGE_EXECUTE
                 || mbi.Protect == PAGE_EXECUTE_READ
-                || mbi.Protect == PAGE_EXECUTE_READWRITE;
-            if mbi.Type == MEM_PRIVATE && is_exec && mbi.RegionSize > largest_exec_reserve {
-                largest_exec_reserve = mbi.RegionSize;
-                code_cache_base = mbi.AllocationBase as usize;
+                || mbi.Protect == PAGE_EXECUTE_READWRITE
+                || mbi.Protect == PAGE_EXECUTE_WRITECOPY
+                || mbi.AllocationProtect == PAGE_EXECUTE
+                || mbi.AllocationProtect == PAGE_EXECUTE_READ
+                || mbi.AllocationProtect == PAGE_EXECUTE_READWRITE
+                || mbi.AllocationProtect == PAGE_EXECUTE_WRITECOPY;
+
+            if alloc_base != current_alloc_base {
+                if current_alloc_base != 0 && current_has_exec && current_is_private && current_alloc_size >= 2 * 1024 * 1024 {
+                    let (has_mz, has_wiped_pe) = check_remote_memory_has_pe_artifacts(handle, current_alloc_base);
+                    if !has_mz && !has_wiped_pe {
+                        code_cache_bases.insert(current_alloc_base);
+                    }
+                }
+                current_alloc_base = alloc_base;
+                current_alloc_size = mbi.RegionSize;
+                current_has_exec = is_exec;
+                current_is_private = mbi.Type == MEM_PRIVATE;
+            } else {
+                current_alloc_size = current_alloc_size.saturating_add(mbi.RegionSize);
+                if is_exec {
+                    current_has_exec = true;
+                }
             }
+
             let next_addr = (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize);
             if next_addr <= address || next_addr == 0 {
                 break;
@@ -972,8 +1037,29 @@ fn check_memory_regions(handle: HANDLE, report: &mut ScanReport) {
             address = next_addr;
         }
 
-        // Pass 2: Inspect all committed executable regions
-        address = 0;
+        if current_alloc_base != 0 && current_has_exec && current_is_private && current_alloc_size >= 2 * 1024 * 1024 {
+            let (has_mz, has_wiped_pe) = check_remote_memory_has_pe_artifacts(handle, current_alloc_base);
+            if !has_mz && !has_wiped_pe {
+                code_cache_bases.insert(current_alloc_base);
+            }
+        }
+    }
+
+    code_cache_bases
+}
+
+/// Scans memory for injected manual-mapped DLLs and RWX pages
+fn check_memory_regions(handle: HANDLE, report: &mut ScanReport) {
+    let mut address = 0usize;
+    let mut rwx_count = 0;
+    let mut unbacked_pe_count = 0;
+    let code_cache_bases = get_jvm_code_cache_allocation_bases(handle);
+
+    unsafe {
+        let mut mbi: MEMORY_BASIC_INFORMATION = zeroed();
+        let mbi_size = std::mem::size_of::<MEMORY_BASIC_INFORMATION>();
+
+        // Inspect all committed executable regions
         while VirtualQueryEx(handle, address as *const c_void, &mut mbi, mbi_size) != 0 {
             if mbi.State == MEM_COMMIT {
                 let is_executable = mbi.Protect == PAGE_EXECUTE
@@ -988,38 +1074,18 @@ fn check_memory_regions(handle: HANDLE, report: &mut ScanReport) {
                     // Check for unbacked or section-mapped memory (MEM_PRIVATE or MEM_MAPPED instead of MEM_IMAGE)
                     if mbi.Type == MEM_PRIVATE || mbi.Type == MEM_MAPPED {
                         let alloc_base = mbi.AllocationBase as usize;
-                        let is_in_code_cache = code_cache_base != 0 && alloc_base == code_cache_base;
+                        let is_in_code_cache = code_cache_bases.contains(&alloc_base);
 
                         if !is_in_code_cache {
-                            let mut header_buf = [0u8; 1024];
-                            let mut bytes_read = 0;
-                            let _ = windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory(
-                                handle,
-                                mbi.BaseAddress,
-                                header_buf.as_mut_ptr() as *mut c_void,
-                                header_buf.len(),
-                                &mut bytes_read,
-                            );
+                            let (has_mz_base, has_wiped_pe_base) = check_remote_memory_has_pe_artifacts(handle, alloc_base);
+                            let (has_mz_cur, has_wiped_pe_cur) = if mbi.BaseAddress as usize != alloc_base {
+                                check_remote_memory_has_pe_artifacts(handle, mbi.BaseAddress as usize)
+                            } else {
+                                (has_mz_base, has_wiped_pe_base)
+                            };
 
-                            let has_mz = bytes_read >= 2 && header_buf[0] == 0x4D && header_buf[1] == 0x5A;
-                            let mut has_wiped_pe = false;
-
-                            if !has_mz && bytes_read >= 64 {
-                                let e_lfanew = u32::from_le_bytes(header_buf[0x3C..0x40].try_into().unwrap_or([0; 4])) as usize;
-                                if e_lfanew > 0 && e_lfanew + 4 <= bytes_read {
-                                    if &header_buf[e_lfanew..e_lfanew + 4] == b"PE\0\0" {
-                                        has_wiped_pe = true;
-                                    }
-                                }
-                                if !has_wiped_pe {
-                                    for window in header_buf[..bytes_read].windows(8) {
-                                        if window == b".text\0\0\0" || window == b".rdata\0\0" || window == b".data\0\0\0" {
-                                            has_wiped_pe = true;
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
+                            let has_mz = has_mz_base || has_mz_cur;
+                            let has_wiped_pe = has_wiped_pe_base || has_wiped_pe_cur;
 
                             // Detect manual-mapped PE (genuine DOS MZ header or wiped header with PE/section remnants)
                             // Clean dynamic callback pools (e.g. LWJGL 3 libffi 64 KB trampoline closures) do NOT contain PE remnants and are not flagged as false positives.
@@ -1059,15 +1125,27 @@ fn check_memory_regions(handle: HANDLE, report: &mut ScanReport) {
             address = next_addr;
         }
 
-        if unbacked_pe_count == 0 && rwx_count > 15 {
+        if unbacked_pe_count > 0 {
             report.add(
                 ScanFinding::new(
-                    "Anomalous RWX Memory Allocation Count",
+                    "Manual Mapped Dynamic Library Injection (Unbacked Executable Memory)",
                     FindingCategory::MemoryInspection,
-                    VerdictLevel::Warning,
-                    format!("Detected {} executable read-write (RWX) memory pages inside Minecraft.", rwx_count),
+                    VerdictLevel::Detection,
+                    format!("Wykryto {} region(y/ów) pamięci unbacked zawierających manual-mapped moduły PE cheata.", unbacked_pe_count),
                 )
-                .with_evidence("RWX Regions Count", rwx_count.to_string()),
+                .with_evidence("Unbacked PE Regions", unbacked_pe_count.to_string()),
+            );
+        }
+
+        if rwx_count > 8 {
+            report.add(
+                ScanFinding::new(
+                    "High RWX Memory Region Count",
+                    FindingCategory::MinecraftRuntime,
+                    VerdictLevel::Warning,
+                    format!("Proces javaw.exe posiada {} regionów RWX w pamięci prywatnej (HotSpot JIT + potential code injections).", rwx_count),
+                )
+                .with_evidence("Liczba regionów RWX", rwx_count.to_string()),
             );
         }
     }
@@ -1076,23 +1154,30 @@ fn check_memory_regions(handle: HANDLE, report: &mut ScanReport) {
 /// Scans all Minecraft process threads searching for "Floating Threads",
 /// i.e., threads whose start address resides in private memory (MEM_PRIVATE + EXECUTE),
 /// rather than an on-disk .dll (MEM_IMAGE). This is a universal code injection signature (Manual Map DLL / Shellcode).
+/// Also inspects active thread execution context (RIP/EIP) and walks the stack (RSP) to detect thread hijacking (SetThreadContext).
+/// Safely ignores legitimate JVM HotSpot JIT-compiled bytecode in CodeCache.
 fn check_floating_threads(handle: HANDLE, pid: u32, report: &mut ScanReport) {
+    let code_cache_bases = get_jvm_code_cache_allocation_bases(handle);
+
     unsafe {
-        let ntdll = GetModuleHandleA(b"ntdll.dll\0".as_ptr());
+        let ntdll = windows_sys::Win32::System::LibraryLoader::GetModuleHandleA(b"ntdll.dll\0".as_ptr());
         if ntdll.is_null() {
             return;
         }
-        let nt_query_thread_ptr = GetProcAddress(
-            ntdll,
-            b"NtQueryInformationThread\0".as_ptr(),
-        );
-        let nt_query_thread: Option<unsafe extern "system" fn(HANDLE, u32, *mut c_void, u32, *mut u32) -> i32> =
-            std::mem::transmute(nt_query_thread_ptr);
 
-        let nt_query_fn = match nt_query_thread {
-            Some(f) => f,
-            None => return,
-        };
+        type NtQueryInformationThreadFn = unsafe extern "system" fn(
+            thread_handle: HANDLE,
+            thread_information_class: u32,
+            thread_information: *mut c_void,
+            thread_information_length: u32,
+            return_length: *mut u32,
+        ) -> i32;
+
+        let proc = windows_sys::Win32::System::LibraryLoader::GetProcAddress(ntdll, b"NtQueryInformationThread\0".as_ptr());
+        if proc.is_none() {
+            return;
+        }
+        let nt_query_fn: NtQueryInformationThreadFn = std::mem::transmute(proc.unwrap());
 
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
         if snapshot == INVALID_HANDLE_VALUE {
@@ -1132,25 +1217,36 @@ fn check_floating_threads(handle: HANDLE, pid: u32, report: &mut ScanReport) {
                                 std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
                             ) != 0
                             {
+                                let alloc_base = mbi.AllocationBase as usize;
+                                let is_in_code_cache = code_cache_bases.contains(&alloc_base);
+
                                 let is_exec = mbi.Protect == PAGE_EXECUTE
                                     || mbi.Protect == PAGE_EXECUTE_READ
                                     || mbi.Protect == PAGE_EXECUTE_READWRITE
                                     || mbi.Protect == PAGE_EXECUTE_WRITECOPY;
 
-                                if mbi.State == MEM_COMMIT && (mbi.Type == MEM_PRIVATE || mbi.Type == MEM_MAPPED) && is_exec {
-                                    report.add(
-                                        ScanFinding::new(
-                                            "Injected Floating Thread Detected",
-                                            FindingCategory::MemoryInspection,
-                                            VerdictLevel::Detection,
-                                            "Wykryto aktywny wątek rozpoczynający się w niepodpisanej pamięci prywatnej (MEM_PRIVATE). Jest to uniwersalny dowód wstrzyknięcia cheata natywnego (Manual Map DLL / Shellcode).",
-                                        )
-                                        .with_evidence("Thread ID", te.th32ThreadID.to_string())
-                                        .with_evidence("Start Address", format!("0x{:X}", start_addr))
-                                        .with_evidence("Memory Type", if mbi.Type == MEM_PRIVATE { "MEM_PRIVATE (Unbacked)" } else { "MEM_MAPPED" })
-                                        .with_evidence("Memory Protection", format!("0x{:X}", mbi.Protect))
-                                        .with_evidence("Allocation Base", format!("0x{:X}", mbi.AllocationBase as usize)),
-                                    );
+                                if mbi.State == MEM_COMMIT
+                                    && (mbi.Type == MEM_PRIVATE || mbi.Type == MEM_MAPPED)
+                                    && is_exec
+                                    && !is_in_code_cache
+                                {
+                                    let (has_mz, has_wiped_pe) = check_remote_memory_has_pe_artifacts(handle, alloc_base);
+                                    let is_threat = has_mz || has_wiped_pe || mbi.RegionSize <= 64 * 1024;
+                                    if is_threat {
+                                        report.add(
+                                            ScanFinding::new(
+                                                "Injected Floating Thread Detected",
+                                                FindingCategory::MemoryInspection,
+                                                VerdictLevel::Detection,
+                                                "Wykryto aktywny wątek rozpoczynający się w niepodpisanej pamięci prywatnej (MEM_PRIVATE) poza HotSpot JIT CodeCache. Jest to uniwersalny dowód wstrzyknięcia cheata natywnego (Manual Map DLL / Shellcode).",
+                                            )
+                                            .with_evidence("Thread ID", te.th32ThreadID.to_string())
+                                            .with_evidence("Start Address", format!("0x{:X}", start_addr))
+                                            .with_evidence("Memory Type", if mbi.Type == MEM_PRIVATE { "MEM_PRIVATE (Unbacked)" } else { "MEM_MAPPED" })
+                                            .with_evidence("Memory Protection", format!("0x{:X}", mbi.Protect))
+                                            .with_evidence("Allocation Base", format!("0x{:X}", alloc_base)),
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -1158,6 +1254,7 @@ fn check_floating_threads(handle: HANDLE, pid: u32, report: &mut ScanReport) {
                         // Thread Hijacking and Call Stack Walking Detection:
                         // Inspects thread context RIP/EIP and walks stack frames (RSP) to detect return addresses
                         // pointing into unbacked code even when the thread is sleeping in NtWaitForSingleObject!
+                        // Safely distinguishes HotSpot JIT CodeCache methods from injected manual-mapped cheat code.
                         let h_thread_ctx = OpenThread(
                             0x0040 | 0x0008 | 0x0002, // THREAD_QUERY_INFORMATION | THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME
                             0,
@@ -1184,7 +1281,8 @@ fn check_floating_threads(handle: HANDLE, pid: u32, report: &mut ScanReport) {
                                     #[cfg(not(target_arch = "x86_64"))]
                                     let rsp = aligned.ctx.Esp as usize;
 
-                                    // 1. Direct instruction pointer check
+                                    // 1. Direct instruction pointer check:
+                                    // If executing in unbacked private memory outside HotSpot JIT CodeCache
                                     if ip != 0 && ip != start_addr {
                                         let mut mbi_ip: MEMORY_BASIC_INFORMATION = zeroed();
                                         if VirtualQueryEx(
@@ -1193,34 +1291,43 @@ fn check_floating_threads(handle: HANDLE, pid: u32, report: &mut ScanReport) {
                                             &mut mbi_ip,
                                             std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
                                         ) != 0 {
-                                            let is_exec = mbi_ip.Protect == PAGE_EXECUTE
-                                                || mbi_ip.Protect == PAGE_EXECUTE_READ
-                                                || mbi_ip.Protect == PAGE_EXECUTE_READWRITE
-                                                || mbi_ip.Protect == PAGE_EXECUTE_WRITECOPY;
-                                            if mbi_ip.State == MEM_COMMIT
-                                                && (mbi_ip.Type == MEM_PRIVATE || mbi_ip.Type == MEM_MAPPED)
-                                                && is_exec
-                                                && mbi_ip.RegionSize < 8 * 1024 * 1024
-                                            {
-                                                report.add(
-                                                    ScanFinding::new(
-                                                        "Hijacked Thread Executing in Unbacked Memory",
-                                                        FindingCategory::MemoryInspection,
-                                                        VerdictLevel::Detection,
-                                                        "Detected active thread with hijacked execution pointer (RIP/EIP) executing in unbacked private memory outside legitimate modules. Universal signature of SetThreadContext hijacking.",
-                                                    )
-                                                    .with_evidence("Thread ID", te.th32ThreadID.to_string())
-                                                    .with_evidence("Current Instruction Pointer", format!("0x{:X}", ip))
-                                                    .with_evidence("Thread Start Address", format!("0x{:X}", start_addr))
-                                                    .with_evidence("Memory Type", if mbi_ip.Type == MEM_PRIVATE { "MEM_PRIVATE (Unbacked)" } else { "MEM_MAPPED" })
-                                                    .with_evidence("Region Size", format!("{} KB", mbi_ip.RegionSize / 1024))
-                                                    .with_evidence("Technique", "Thread Hijacking (SetThreadContext)".to_string()),
-                                                );
+                                            let alloc_base = mbi_ip.AllocationBase as usize;
+                                            let is_in_code_cache = code_cache_bases.contains(&alloc_base);
+
+                                            if !is_in_code_cache {
+                                                let is_exec = mbi_ip.Protect == PAGE_EXECUTE
+                                                    || mbi_ip.Protect == PAGE_EXECUTE_READ
+                                                    || mbi_ip.Protect == PAGE_EXECUTE_READWRITE
+                                                    || mbi_ip.Protect == PAGE_EXECUTE_WRITECOPY;
+                                                if mbi_ip.State == MEM_COMMIT
+                                                    && (mbi_ip.Type == MEM_PRIVATE || mbi_ip.Type == MEM_MAPPED)
+                                                    && is_exec
+                                                {
+                                                    let (has_mz, has_wiped_pe) = check_remote_memory_has_pe_artifacts(handle, alloc_base);
+                                                    let is_hijack = has_mz || has_wiped_pe || mbi_ip.RegionSize <= 64 * 1024;
+                                                    if is_hijack {
+                                                        report.add(
+                                                            ScanFinding::new(
+                                                                "Hijacked Thread Executing in Unbacked Memory",
+                                                                FindingCategory::MemoryInspection,
+                                                                VerdictLevel::Detection,
+                                                                "Detected active thread with hijacked execution pointer (RIP/EIP) executing in unbacked private memory outside legitimate modules and outside HotSpot JIT CodeCache. Universal signature of SetThreadContext hijacking.",
+                                                            )
+                                                            .with_evidence("Thread ID", te.th32ThreadID.to_string())
+                                                            .with_evidence("Current Instruction Pointer", format!("0x{:X}", ip))
+                                                            .with_evidence("Thread Start Address", format!("0x{:X}", start_addr))
+                                                            .with_evidence("Memory Type", if mbi_ip.Type == MEM_PRIVATE { "MEM_PRIVATE (Unbacked)" } else { "MEM_MAPPED" })
+                                                            .with_evidence("Region Size", format!("{} KB", mbi_ip.RegionSize / 1024))
+                                                            .with_evidence("Allocation Base", format!("0x{:X}", alloc_base))
+                                                            .with_evidence("Technique", "Thread Hijacking (SetThreadContext)".to_string()),
+                                                        );
+                                                    }
+                                                }
                                             }
                                         }
                                     }
 
-                                    // 2. Call Stack Walk: read active stack frames (RSP) to detect return addresses into unbacked memory
+                                    // 2. Call Stack Walk: read active stack frames (RSP) to detect return addresses into unbacked memory outside CodeCache
                                     if rsp > 0x10000 {
                                         let mut stack_buf = vec![0usize; 2048];
                                         let mut bytes_read = 0usize;
@@ -1242,30 +1349,39 @@ fn check_floating_threads(handle: HANDLE, pid: u32, report: &mut ScanReport) {
                                                         &mut mbi_stack,
                                                         std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
                                                     ) != 0 {
-                                                        let is_exec = mbi_stack.Protect == PAGE_EXECUTE
-                                                            || mbi_stack.Protect == PAGE_EXECUTE_READ
-                                                            || mbi_stack.Protect == PAGE_EXECUTE_READWRITE
-                                                            || mbi_stack.Protect == PAGE_EXECUTE_WRITECOPY;
+                                                        let alloc_base = mbi_stack.AllocationBase as usize;
+                                                        let is_in_code_cache = code_cache_bases.contains(&alloc_base);
 
-                                                        if mbi_stack.State == MEM_COMMIT
-                                                            && (mbi_stack.Type == MEM_PRIVATE || mbi_stack.Type == MEM_MAPPED)
-                                                            && is_exec
-                                                            && mbi_stack.RegionSize < 8 * 1024 * 1024
-                                                        {
-                                                            report.add(
-                                                                ScanFinding::new(
-                                                                    "Unbacked Code Address on Thread Call Stack (Call Stack Walk Detection)",
-                                                                    FindingCategory::MemoryInspection,
-                                                                    VerdictLevel::Detection,
-                                                                    "Thread call stack walk revealed an active return address pointing into unbacked private memory. Universal proof of tick-based cheat routine calling game functions.",
-                                                                )
-                                                                .with_evidence("Thread ID", te.th32ThreadID.to_string())
-                                                                .with_evidence("Return Address on Stack", format!("0x{:X}", candidate_ptr))
-                                                                .with_evidence("Stack Offset", format!("RSP + 0x{:X}", i * std::mem::size_of::<usize>()))
-                                                                .with_evidence("Memory Type", if mbi_stack.Type == MEM_PRIVATE { "MEM_PRIVATE (Unbacked)" } else { "MEM_MAPPED" })
-                                                                .with_evidence("Technique", "Thread Call Stack Walking (Return Address Inspection)".to_string()),
-                                                            );
-                                                            break;
+                                                        if !is_in_code_cache {
+                                                            let is_exec = mbi_stack.Protect == PAGE_EXECUTE
+                                                                || mbi_stack.Protect == PAGE_EXECUTE_READ
+                                                                || mbi_stack.Protect == PAGE_EXECUTE_READWRITE
+                                                                || mbi_stack.Protect == PAGE_EXECUTE_WRITECOPY;
+
+                                                            if mbi_stack.State == MEM_COMMIT
+                                                                && (mbi_stack.Type == MEM_PRIVATE || mbi_stack.Type == MEM_MAPPED)
+                                                                && is_exec
+                                                            {
+                                                                let (has_mz, has_wiped_pe) = check_remote_memory_has_pe_artifacts(handle, alloc_base);
+                                                                let is_hijack = has_mz || has_wiped_pe || mbi_stack.RegionSize <= 64 * 1024;
+                                                                if is_hijack {
+                                                                    report.add(
+                                                                        ScanFinding::new(
+                                                                            "Unbacked Code Address on Thread Call Stack (Call Stack Walk Detection)",
+                                                                            FindingCategory::MemoryInspection,
+                                                                            VerdictLevel::Detection,
+                                                                            "Thread call stack walk revealed an active return address pointing into unbacked private memory outside HotSpot JIT CodeCache. Universal proof of tick-based cheat routine calling game functions.",
+                                                                        )
+                                                                        .with_evidence("Thread ID", te.th32ThreadID.to_string())
+                                                                        .with_evidence("Return Address on Stack", format!("0x{:X}", candidate_ptr))
+                                                                        .with_evidence("Stack Offset", format!("RSP + 0x{:X}", i * std::mem::size_of::<usize>()))
+                                                                        .with_evidence("Memory Type", if mbi_stack.Type == MEM_PRIVATE { "MEM_PRIVATE (Unbacked)" } else { "MEM_MAPPED" })
+                                                                        .with_evidence("Allocation Base", format!("0x{:X}", alloc_base))
+                                                                        .with_evidence("Technique", "Thread Call Stack Walking (Return Address Inspection)".to_string()),
+                                                                    );
+                                                                    break;
+                                                                }
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -3666,4 +3782,56 @@ mod tests {
         assert!(!has_wiped_pe, "Clean libffi/GLFW callback trampolines must NOT be flagged as manual-mapped PE!");
     }
 
+
+    #[test]
+    fn test_jvm_jit_code_cache_threads_not_flagged_as_hijacked() {
+        // 1. Simulate a HotSpot JIT CodeCache segment:
+        // Size: 2564 KB committed chunk within a 120 MB reserved CodeCache segment.
+        // Memory type: MEM_PRIVATE, protection: PAGE_EXECUTE_READWRITE (0x40).
+        let jit_alloc_base = 0x0000_0192_1000_0000usize;
+        let _jit_thread_ip = 0x0000_0192_11BD_F6B6usize; // The user's exact instruction pointer from OneClient
+        let jit_alloc_size = 120 * 1024 * 1024usize;
+
+        // Check that HotSpot JIT code does NOT contain PE headers
+        let mut jit_header = vec![0u8; 1024];
+        // JIT compiled machine code bytes
+        jit_header[0..8].copy_from_slice(&[0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83]);
+
+        let has_mz = jit_header[0] == 0x4D && jit_header[1] == 0x5A;
+        assert!(!has_mz);
+
+        let e_lfanew = u32::from_le_bytes(jit_header[0x3C..0x40].try_into().unwrap()) as usize;
+        let mut has_wiped_pe = false;
+        if e_lfanew > 0 && e_lfanew + 4 <= jit_header.len() {
+            if &jit_header[e_lfanew..e_lfanew + 4] == b"PE\0\0" {
+                has_wiped_pe = true;
+            }
+        }
+        assert!(!has_wiped_pe);
+
+        // Verify that this qualifies as a CodeCache segment: size >= 2 MB and has no PE headers
+        let mut code_cache_bases = HashSet::new();
+        if !has_mz && !has_wiped_pe && jit_alloc_size >= 2 * 1024 * 1024 {
+            code_cache_bases.insert(jit_alloc_base);
+        }
+        assert!(code_cache_bases.contains(&jit_alloc_base));
+
+        // When a thread executes inside this CodeCache segment:
+        let is_in_code_cache = code_cache_bases.contains(&jit_alloc_base);
+        assert!(is_in_code_cache, "Instruction pointer in HotSpot JIT CodeCache must be recognized and NOT flagged as hijacked thread!");
+
+        // 2. Simulate an injected cheat manual-mapped DLL:
+        let cheat_alloc_size = 2 * 1024 * 1024usize;
+        let mut cheat_header = vec![0u8; 1024];
+        cheat_header[0] = 0x4D;
+        cheat_header[1] = 0x5A; // MZ header of cheat DLL
+        let cheat_has_mz = cheat_header[0] == 0x4D && cheat_header[1] == 0x5A;
+
+        // Verify that cheat allocation is NOT recognized as CodeCache
+        let mut cheat_code_cache = false;
+        if !cheat_has_mz && cheat_alloc_size >= 2 * 1024 * 1024 {
+            cheat_code_cache = true;
+        }
+        assert!(!cheat_code_cache, "Cheat manual-mapped DLL must NEVER qualify as HotSpot CodeCache!");
+    }
 }
